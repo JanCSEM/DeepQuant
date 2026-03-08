@@ -8,8 +8,11 @@ import os
 import torch
 import torch.nn as nn
 from pathlib import Path
+import numpy as np
+import onnxruntime as ort
+import onnx
 
-from DeepQuant.DeepQuant.TransformQuant import canonicalize_qdq_graph
+from DeepQuant.DeepQuant.TransformQuant import canonicalize_qdq_graph, fuse_rescale_qdq, remove_trailing_qdq, replace_mul_with_dequant_and_quant_pattern
 from DeepQuant.Injects.Transformations import (
     LinearTransformation,  # Transformation for quantized linear layers (QuantLinear, QuantConv2d)
     ActivationTransformation,  # Transformation for quantized activation functions (QuantReLU, etc.)
@@ -253,14 +256,16 @@ def exportBrevitas(
     #         f"{RED} ✗ Modification of Dequant Nodes changed the output significantly{ENDC}"
     #     )
 
-    import numpy as np
-    import onnxruntime as ort
-    import onnx
 
     # Step 2: Load the model and run shape inference
     # (All tensors in ONNX graph should have explicit shape information)
     onnx_model = onnx.load_model_from_string(f.getvalue())
 
+    onnx_model = replace_mul_with_dequant_and_quant_pattern(onnx_model)  # Replace QDQ nodes with separate Quant and Dequant nodes
+    
+    onnx_model = fuse_rescale_qdq(onnx_model)  # Fuse consecutive Rescale-QDQ patterns into single nodes
+    
+    onnx_model = remove_trailing_qdq(onnx_model)  # Remove unnecessary trailing QDQ nodes at the end of the graph
     # onnx_model = canonicalize_qdq_graph(
     #     onnx_model,
     #     assume_input_quantized=True,
