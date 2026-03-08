@@ -129,5 +129,31 @@ class Dequant(nn.Module):
         """
         if self.scale is None or self.zero_point is None:
             return x
+        if isinstance(self.scale, torch.Tensor):
+            if len(x.shape) != len(self.scale.shape) and len(x.shape) == 4:
+                # Handle per-channel quantization for convolutional layers
+                # find channel dimension and reshape scale accordingly
+                if x.shape[1] == self.scale.shape[0]:
+                    self.scale = self.scale.view(1, -1, 1, 1)
+
+                elif x.shape[0] == self.scale.shape[0]:
+                    self.scale = self.scale.view(-1, 1, 1, 1)
+                else:
+                    raise ValueError(f"Cannot determine channel dimension for dequantization: x shape {x.shape}, scale shape {self.scale.shape}")
+            
+            elif len(x.shape) != len(self.scale.shape)and len(x.shape) == 3:
+                # Handle per-channel quantization for RNN layers
+                # Assuming scale shape is (C_out,) and x shape is (N, C_out, T)
+                self.scale = self.scale.view(1, -1, 1)
+                
+            elif len(x.shape) != len(self.scale.shape) and len(x.shape) == 2:
+                # Handle per-channel quantization for linear layers
+                # Assuming scale shape is (C_out,) and x shape is (N, C_out)
+                if x.shape[1] == self.scale.shape[0]:
+                    self.scale = self.scale.view(1, -1)
+
+                elif x.shape[0] == self.scale.shape[0]:
+                    self.scale = self.scale.view(-1, 1)
+        
         x_dequant = (x - self.zero_point) * self.scale
         return x_dequant
