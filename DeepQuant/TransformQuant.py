@@ -295,9 +295,10 @@ def replace_mul_with_dequant_and_quant_pattern(onnx_model: onnx.ModelProto) -> o
             # Create a new Dequant node
             dequant_node = gs.Node(
                 op="Dequant",
-                name=node.name + "_dequant" if node.name else "Dequant",
+                name=node.name + "_dequant" if node.name else "_dequant",
                 inputs=[node.inputs[0], node.inputs[1]],
-                outputs=node.outputs
+                outputs=node.outputs,
+                domain="ai.onnx.contrib"
             )
             nodes_to_add.append(dequant_node)
             nodes_to_remove.append(node)
@@ -325,15 +326,19 @@ def replace_mul_with_dequant_and_quant_pattern(onnx_model: onnx.ModelProto) -> o
             # Determine signedness and number of levels
             signed = bool(clip_min_val < 0)
             n_levels = int(clip_max_val - clip_min_val + 1)
-
             # Create a new Quant node with the inferred attributes
             quant_node = gs.Node(
                 op="Quant",
-                name=clip_node.name + "_quant" if clip_node.name else "Quant",
+                name=clip_node.name + "_quant" if clip_node.name else "_quant",
                 # Inputs from Div, outputs from Clip
-                inputs=[node.inputs[0], node.inputs[1]],
+                inputs=[node.inputs[0], 
+                        node.inputs[1], 
+                        gs.Constant(f"{clip_node.name}_n_levels", np.array(n_levels, dtype=np.int64)),
+                        gs.Constant(f"{clip_node.name}_signed", np.array(int(signed), dtype=np.int64)),
+                ],
                 outputs=clip_node.outputs,
-                attrs={"n_levels": n_levels, "signed": signed}
+                attrs={"n_levels": n_levels, "signed": int(signed)},
+                domain="ai.onnx.contrib"
             )
             nodes_to_add.append(quant_node)
             # Mark the entire pattern for removal
