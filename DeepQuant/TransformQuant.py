@@ -132,7 +132,6 @@ def _strip_qdq_backwards(var: gs.Variable, producers, nodes_to_drop_ids: set) ->
 
     return cur
 
-
 def _has_input_ancestor(var: gs.Variable, producers: dict, graph_input_names: set, max_hops: int = 256) -> bool:
     """
     True if `var` is on a path originating from a graph input.
