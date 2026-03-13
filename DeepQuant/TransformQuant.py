@@ -5,9 +5,10 @@ import numpy as np
 import onnx.helper as helper
 
 _LINEAR_OPS = {"Conv", "Gemm", "MatMul"}
-_POOL_OPS = {"MaxPool", "AveragePool", "GlobalAveragePool"}
+_QUANT_AGNOSTIC_OPS = {"MaxPool", "Reshape", "Gather", "Flatten", "AveragePool", "GlobalAveragePool", "Transpose", "Squeeze", "Unsqueeze"}
 _NONLINEAR_OPS = {"Gelu", "Softmax", "Sigmoid", "Tanh"}
 _NORM_OPS = {"BatchNorm", "LayerNorm", "GroupNorm"}
+_PARAMETERIZABLE_OPS = _LINEAR_OPS.union(_NORM_OPS)
 
 def _is_const(x):
     return isinstance(x, gs.Constant)
@@ -132,150 +133,92 @@ def _strip_qdq_backwards(var: gs.Variable, producers, nodes_to_drop_ids: set) ->
 
     return cur
 
-def _has_input_ancestor(var: gs.Variable, producers: dict, graph_input_names: set, max_hops: int = 256) -> bool:
+def rename_parameter_initializers(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
     """
-    True if `var` is on a path originating from a graph input.
+    Renames the initializers (weights and biases) of parameterizable layers
+    to match PyTorch's naming convention (e.g., 'node_name.weight').
     """
-    cur = var
-    hops = 0
-    while isinstance(cur, gs.Variable) and hops < max_hops:
-        if cur.name in graph_input_names:
-            return True
-        p = producers.get(cur.name)
-        if p is None:
-            return False
-        nxt = _non_const_input(p)
-        if nxt is None:
-            return False
-        cur = nxt
-        hops += 1
-    return False
-# ...existing code...
+    graph = gs.import_onnx(onnx_model)
 
-def canonicalize_qdq_graph(
-    model: onnx.ModelProto,
-    assume_input_quantized: bool = True,
-    remove_output_dequant: bool = True,
-) -> onnx.ModelProto:
-    graph = gs.import_onnx(model)
-    nodes_to_drop_ids = set()
-
-    # ---------- Rule 1: remove Q/DQ only on activation path to first Linear_OP ----------
-    producers, consumers = _build_maps(graph)
-    graph_input_names = {i.name for i in graph.inputs if isinstance(i, gs.Variable)}
-
-    if assume_input_quantized:
-        first_linear = next((n for n in graph.nodes if n.op in _LINEAR_OPS), None)
-        if first_linear is not None and first_linear.inputs:
-            # Only activation input (index 0), never weights/bias
-            inp = first_linear.inputs[0]
-            if isinstance(inp, gs.Variable) and _has_input_ancestor(inp, producers, graph_input_names):
-                first_linear.inputs[0] = _strip_qdq_backwards(inp, producers, nodes_to_drop_ids)
-
-    # ---------- Rule 3: no dequant before pooling ----------
-    producers, consumers = _build_maps(graph)
-    for pool in graph.nodes:
-        if pool.op not in _POOL_OPS or not pool.inputs:
+    for node in graph.nodes:
+        if node.op not in _PARAMETERIZABLE_OPS:
             continue
 
-        in0 = pool.inputs[0]
-        if not isinstance(in0, gs.Variable):
+        # Node name must not be empty to create a meaningful name
+        if not node.name:
             continue
 
-        p = producers.get(in0.name)
-        if _is_mul_dequant(p):
-            src = _non_const_input(p)
-            if src is not None:
-                pool.inputs[0] = src
-                _mark_drop(nodes_to_drop_ids, p)
+        # --- Handle Weight Tensor (usually the second input) ---
+        if len(node.inputs) > 1 and _is_const(node.inputs[1]):
+            weight_tensor = node.inputs[1]
+            weight_tensor.name = f"{node.name}.weight"
 
-    # Also remove immediate quant right after pool: pool -> Div/(Add)->Round->Clip
-    producers, consumers = _build_maps(graph)
-    for pool in graph.nodes:
-        if pool.op not in _POOL_OPS or not pool.outputs:
-            continue
-        pool_out = pool.outputs[0]
-        pool_users = consumers.get(pool_out.name, [])
-        if len(pool_users) != 1:
-            continue
-        u = pool_users[0]
-        if u.op != "Div":
-            continue
+        # --- Handle Bias Tensor (usually the third input) ---
+        if len(node.inputs) > 2 and _is_const(node.inputs[2]):
+            bias_tensor = node.inputs[2]
+            # For LayerNorm/GroupNorm, the third input is the bias.
+            # For Conv/Gemm, it's also the bias.
+            bias_tensor.name = f"{node.name}.bias"
 
-        div = u
-        c1 = consumers.get(div.outputs[0].name, [])
-        add = None
-        if len(c1) == 1 and c1[0].op == "Add":
-            add = c1[0]
-            c1 = consumers.get(add.outputs[0].name, [])
-        if len(c1) != 1 or c1[0].op != "Round":
-            continue
-        rnd = c1[0]
-        c2 = consumers.get(rnd.outputs[0].name, [])
-        if len(c2) != 1 or c2[0].op != "Clip":
-            continue
-        clip = c2[0]
+    return gs.export_onnx(graph)
 
-        q_out = clip.outputs[0]
-        _replace_all_consumers(graph, q_out, pool_out)
-        _mark_drop(nodes_to_drop_ids, div, add, rnd, clip)
+def move_agnostic_ops_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """
+    Moves quantization-agnostic operations to be after a QDQ pair.
+    Identifies the pattern: Dequant -> AgnosticOp -> Quant
+    And transforms it to: Dequant -> Quant -> AgnosticOp
+    This allows the agnostic operation to be performed on integer data.
+    """
+    graph = gs.import_onnx(onnx_model)
+    graph.fold_constants()
 
-    # ---------- Generic collapse: DQ -> Q (restricted) ----------
-    # Only collapse if resulting quantized tensor does NOT feed a linear op.
-    producers, consumers = _build_maps(graph)
-    for n in list(graph.nodes):
-        if not _is_mul_dequant(n) or not n.outputs:
-            continue
-
-        dq_out = n.outputs[0]
-        users = consumers.get(dq_out.name, [])
-        if len(users) != 1:
-            continue
-
-        div = users[0]
-        if div.op != "Div":
-            continue
-
-        c1 = consumers.get(div.outputs[0].name, [])
-        add = None
-        if len(c1) == 1 and c1[0].op == "Add":
-            add = c1[0]
-            c1 = consumers.get(add.outputs[0].name, [])
-        if len(c1) != 1 or c1[0].op != "Round":
-            continue
-        rnd = c1[0]
-        c2 = consumers.get(rnd.outputs[0].name, [])
-        if len(c2) != 1 or c2[0].op != "Clip":
-            continue
-        clip = c2[0]
-
-        q_users = consumers.get(clip.outputs[0].name, [])
-        if any(u.op in _LINEAR_OPS for u in q_users):
-            # Keep quantization feeding Conv/Gemm/MatMul
-            continue
-
-        src = _non_const_input(n)
-        if src is None:
-            continue
-
-        _replace_all_consumers(graph, clip.outputs[0], src)
-        _mark_drop(nodes_to_drop_ids, n, div, add, rnd, clip)
-
-    # ---------- Rule 5: remove output dequant ----------
-    if remove_output_dequant:
-        producers, _ = _build_maps(graph)
-        for i, out in enumerate(graph.outputs):
-            if not isinstance(out, gs.Variable):
+    while True:
+        fusion_occured = False
+        for node in list(graph.nodes):
+            # --- Start pattern match: Find a Dequant node ---
+            if node.op != "Dequant":
                 continue
-            p = producers.get(out.name)
-            if _is_mul_dequant(p):
-                src = _non_const_input(p)
-                if src is not None:
-                    graph.outputs[i] = src
-                    _mark_drop(nodes_to_drop_ids, p)
+            dequant_node = node
 
-    _detach_nodes(graph, nodes_to_drop_ids)
-    graph.nodes = [n for n in graph.nodes if id(n) not in nodes_to_drop_ids]
+            # --- Find the AgnosticOp node ---
+            # It must be the *only* consumer of the Dequant node's output.
+            if not dequant_node.outputs or len(dequant_node.outputs[0].outputs) != 1:
+                continue
+            agnostic_op_node = dequant_node.outputs[0].outputs[0]
+            if agnostic_op_node.op not in _QUANT_AGNOSTIC_OPS:
+                continue
+
+            # --- Find the Quant node ---
+            # It must be the *only* consumer of the AgnosticOp's output.
+            if not agnostic_op_node.outputs or len(agnostic_op_node.outputs[0].outputs) != 1:
+                continue
+            quant_node = agnostic_op_node.outputs[0].outputs[0]
+            if quant_node.op != "Quant":
+                continue
+
+            # --- Pattern Matched: Dequant -> AgnosticOp -> Quant ---
+            # --- Reroute the graph ---
+            # 1. The Quant node's data input should now be the Dequant's output.
+            quant_node.inputs[0] = dequant_node.outputs[0]
+            # 2. The AgnosticOp's data input should now be the Quant's output.
+            agnostic_op_node.inputs[0] = quant_node.outputs[0]
+            if not quant_node.outputs:
+                pass
+            else:
+                # find all consumers of quant_node's output and reroute them to agnostic op's output
+                for consumer in quant_node.outputs[0].outputs:
+                    for k, inp in enumerate(consumer.inputs):
+                        if inp == quant_node.outputs[0]:
+                            consumer.inputs[k] = agnostic_op_node.outputs[0]
+                
+
+            fusion_occured = True
+            # A fusion has changed the graph. Break and restart the scan.
+            break
+
+        if not fusion_occured:
+            break
+
     graph.cleanup().toposort()
     return gs.export_onnx(graph)
 
@@ -334,8 +277,7 @@ def replace_mul_with_dequant_and_quant_pattern(onnx_model: onnx.ModelProto) -> o
                 inputs=[node.inputs[0], 
                         node.inputs[1], 
                         gs.Constant(f"{clip_node.name}_n_levels", np.array(n_levels, dtype=np.int64)),
-                        gs.Constant(f"{clip_node.name}_signed", np.array(int(signed), dtype=np.int64)),
-                ],
+                        gs.Constant(f"{clip_node.name}_signed", np.array(int(signed), dtype=np.int64))                ],
                 outputs=clip_node.outputs,
                 attrs={"n_levels": n_levels, "signed": int(signed)},
                 domain="ai.onnx.contrib"
@@ -353,66 +295,164 @@ def replace_mul_with_dequant_and_quant_pattern(onnx_model: onnx.ModelProto) -> o
 
     return gs.export_onnx(graph)
 
-def fuse_rescale_qdq(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+def remove_intermediate_qdq_and_preserve_relu(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
     """
-    Fuses consecutive Quant -> Dequant pairs.
-    If a (Quant -> Dequant) pair is followed immediately by another
-    (Quant -> Dequant) pair, the first pair is removed.
-    This is done iteratively and safely to prevent graph corruption.
+    Removes an intermediate Quant -> Dequant pair, preserving the ReLU-like
+    clipping if the removed Quant node was unsigned.
+    Identifies: Dequant1 -> Quant2 -> Dequant2 -> Quant3
+    If Quant2 is unsigned, it modifies Quant3 to clip at 0.
+    Otherwise, it connects Dequant1 directly to Quant3.
     """
     graph = gs.import_onnx(onnx_model)
     graph.fold_constants()
 
-    # Use a loop to repeatedly apply the fusion until no more patterns can be found.
-    # This is the safest way to perform complex graph transformations.
     while True:
         fusion_occured = False
-        # Iterate over a copy of the nodes, as the graph will be modified.
         for node in list(graph.nodes):
-            # --- Start pattern match: Find the first Quant node (Quant1) ---
-            if node.op != "Quant":
+            # --- Start pattern match: Find Dequant1 ---
+            if node.op != "Dequant":
                 continue
-            quant1_node = node
+            dequant1_node = node
 
-            # --- Find the first Dequant node (Dequant1) ---
-            # It must be the *only* consumer of Quant1's output.
-            if not quant1_node.outputs or len(quant1_node.outputs[0].outputs) != 1:
-                continue
-            dequant1_node = quant1_node.outputs[0].outputs[0]
-            if dequant1_node.op != "Dequant":
-                continue
-
-            # --- Find the second Quant node (Quant2) ---
-            # It must be the *only* consumer of Dequant1's output.
+            # --- Find Quant2 ---
             if not dequant1_node.outputs or len(dequant1_node.outputs[0].outputs) != 1:
                 continue
             quant2_node = dequant1_node.outputs[0].outputs[0]
             if quant2_node.op != "Quant":
                 continue
 
-            # --- Pattern Matched: Quant1 -> Dequant1 -> Quant2 ---
-            # The full (Q1->D1->Q2->D2) pattern is not needed for this fusion.
-            # We will remove the first pair (Quant1, Dequant1).
+            # --- Find Dequant2 ---
+            if not quant2_node.outputs or len(quant2_node.outputs[0].outputs) != 1:
+                continue
+            dequant2_node = quant2_node.outputs[0].outputs[0]
+            if dequant2_node.op != "Dequant":
+                continue
 
-            # Reroute the graph: Connect the input of Quant1 directly to Quant2.
-            # This bypasses and isolates the first Q->DQ pair.
-            quant2_node.inputs[0] = quant1_node.inputs[0]
+            # --- Find Quant3 ---
+            if not dequant2_node.outputs or len(dequant2_node.outputs[0].outputs) != 1:
+                continue
+            quant3_node = dequant2_node.outputs[0].outputs[0]
+            if quant3_node.op != "Quant":
+                continue
 
-            # Mark the isolated nodes for removal.
-            quant1_node.outputs.clear()
-            dequant1_node.outputs.clear()
+            # --- Pattern Matched: DQ1 -> Q2 -> DQ2 -> Q3 ---
+
+            # Check if Quant2 is unsigned (acting as a ReLU)
+            # We assume the 'signed' parameter is the 4th input (index 3)
+            is_quant2_unsigned = False
+            if len(quant2_node.inputs) > 3 and isinstance(quant2_node.inputs[3], gs.Constant):
+                if int(quant2_node.inputs[3].values) == 0:
+                    is_quant2_unsigned = True
+
+            # Reroute the graph by connecting Dequant1's output to Quant3's input
+            quant3_node.inputs[0] = dequant1_node.outputs[0]
+
+            if is_quant2_unsigned:
+                # --- Modify Quant3 to perform the ReLU clip ---
+                # By changing n_levels to 128 on a signed quantizer, we force the range to [0, 127]
+                # We assume n_levels is the 3rd input (index 2)
+                if len(quant3_node.inputs) > 2 and isinstance(quant3_node.inputs[2], gs.Constant):
+                    n_levels_const = quant3_node.inputs[2]
+                    quant3_node.inputs[2] = gs.Constant(n_levels_const.name, np.array(128, dtype=np.int64))
+
+
+            # Mark the intermediate nodes for removal.
+            quant2_node.outputs.clear()
+            dequant2_node.outputs.clear()
 
             fusion_occured = True
-            # A fusion has changed the graph. Break the inner loop and
-            # restart the scan from the beginning to ensure a consistent state.
             break
 
-        # If a full pass completes with no fusions, the process is done.
         if not fusion_occured:
             break
 
-    # After all fusions are complete, clean up the isolated nodes once.
     graph.cleanup().toposort()
+    return gs.export_onnx(graph)
+
+def decompose_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """
+    Decomposes custom Quant and Dequant nodes back into standard ONNX operators.
+    - Dequant(data, scale) -> Mul(data, scale)
+    - Quant(data, scale, n_levels, signed) -> Div -> Round -> Clip
+    """
+    graph = gs.import_onnx(onnx_model)
+    nodes_to_add = []
+    nodes_to_remove = []
+
+    for node in list(graph.nodes):
+        if node.domain != "ai.onnx.contrib":
+            continue
+
+        # --- Decompose Dequant node ---
+        if node.op == "Dequant":
+            # Dequant(data, scale) -> Mul(data, scale)
+            mul_node = gs.Node(
+                op="Mul",
+                name=f"{node.name}_decomposed_mul",
+                inputs=node.inputs,  # Assumes inputs are [data, scale]
+                outputs=node.outputs
+            )
+            nodes_to_add.append(mul_node)
+            nodes_to_remove.append(node)
+
+        # --- Decompose Quant node ---
+        elif node.op == "Quant":
+            # Quant(data, scale, n_levels, signed) -> Div -> Round -> Clip
+            data_input = node.inputs[0]
+            scale_input = node.inputs[1]
+            n_levels_input = node.inputs[2]
+            signed_input = node.inputs[3]
+
+            # --- Calculate Clip min/max from n_levels and signed ---
+            n_levels = int(n_levels_input.values.item())
+            is_signed = bool(signed_input.values.item())
+
+            if is_signed and n_levels > 128:
+                clip_min = -n_levels // 2
+                clip_max = n_levels // 2 - 1
+            # special relu case
+            elif is_signed and n_levels == 128:
+                clip_min = 0
+                clip_max = 127
+            else:
+                clip_min = 0
+                clip_max = n_levels - 1
+
+            # --- Create the new node chain ---
+            div_output = gs.Variable(name=f"{node.name}_div_out")
+            div_node = gs.Node(
+                op="Div",
+                name=f"{node.name}_decomposed_div",
+                inputs=[data_input, scale_input],
+                outputs=[div_output]
+            )
+
+            round_output = gs.Variable(name=f"{node.name}_round_out")
+            round_node = gs.Node(
+                op="Round",
+                name=f"{node.name}_decomposed_round",
+                inputs=[div_output],
+                outputs=[round_output]
+            )
+
+            clip_min_const = gs.Constant(name=f"{node.name}_clip_min", values=np.array(clip_min, dtype=np.float32))
+            clip_max_const = gs.Constant(name=f"{node.name}_clip_max", values=np.array(clip_max, dtype=np.float32))
+            clip_node = gs.Node(
+                op="Clip",
+                name=f"{node.name}_decomposed_clip",
+                inputs=[round_output, clip_min_const, clip_max_const],
+                outputs=node.outputs  # Final output is the original Quant node's output
+            )
+
+            nodes_to_add.extend([div_node, round_node, clip_node])
+            nodes_to_remove.append(node)
+
+    # Add new nodes and remove old ones
+    graph.nodes.extend(nodes_to_add)
+    for n in nodes_to_remove:
+        n.outputs.clear()
+    graph.cleanup().toposort()
+
     return gs.export_onnx(graph)
 
 def remove_trailing_qdq(onnx_model: onnx.ModelProto) -> onnx.ModelProto:

@@ -14,7 +14,12 @@ import onnx
 from onnxruntime_extensions import get_library_path
 
 
-from DeepQuant.TransformQuant import canonicalize_qdq_graph, fuse_rescale_qdq, remove_trailing_qdq, replace_mul_with_dequant_and_quant_pattern
+from DeepQuant.TransformQuant import move_agnostic_ops_after_quant, \
+                                    remove_intermediate_qdq_and_preserve_relu,\
+                                    remove_trailing_qdq, \
+                                    replace_mul_with_dequant_and_quant_pattern, \
+                                    decompose_quant_dequant_nodes, \
+                                    rename_parameter_initializers
 from DeepQuant.Injects.Transformations import (
     LinearTransformation,  # Transformation for quantized linear layers (QuantLinear, QuantConv2d)
     ActivationTransformation,  # Transformation for quantized activation functions (QuantReLU, etc.)
@@ -248,8 +253,7 @@ def exportBrevitas(
     if torch.allclose(
         outputModel, outputFxModelDequantModified, atol=1e-5
     ):  # Verify numerical consistency
-        if debug:
-            print(f"{BLUE} ✓ Modification of Dequant Nodes: output is consistent{ENDC}")
+        print(f"{BLUE} ✓ Modification of Dequant Nodes: output is consistent{ENDC}")
     else:
         raise RuntimeError(  # Raise error if inconsistent
             f"{RED} ✗ Modification of Dequant Nodes changed the output significantly{ENDC}"
@@ -261,9 +265,10 @@ def exportBrevitas(
     onnx_model = onnx.load_model_from_string(f.getvalue())
 
     onnx_model = replace_mul_with_dequant_and_quant_pattern(onnx_model)  # Replace QDQ nodes with separate Quant and Dequant nodes
-    
-    # onnx_model = fuse_rescale_qdq(onnx_model)  # Fuse consecutive Rescale-QDQ patterns into single nodes
-    
+    onnx_model = move_agnostic_ops_after_quant(onnx_model)
+    onnx_model = remove_intermediate_qdq_and_preserve_relu(onnx_model)  # Fuse consecutive Rescale-QDQ patterns into single nodes
+    onnx_model = decompose_quant_dequant_nodes(onnx_model)  # Decompose complex quant-dequant patterns into simpler nodes
+    onnx_model = rename_parameter_initializers(onnx_model)  # Ensure all initializers have unique names
     # onnx_model = remove_trailing_qdq(onnx_model)  # Remove unnecessary trailing QDQ nodes at the end of the graph
     
     # # Test numerical consistency after ONNX transformations

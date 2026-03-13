@@ -34,8 +34,10 @@ def quant_weight_onnx(w, scale, n_levels=256, signed=True):
         raise ValueError(f"Unsupported combination of signed={signed} and n_levels={n_levels}")
     return q_w
 
-@onnx_op(op_type="Quant", inputs=[PyOp.dt_float,  PyOp.dt_float, PyOp.dt_int64, PyOp.dt_int64], outputs=[PyOp.dt_float])
-def quant_activation_onnx(x, scale, n_levels, signed, **kwargs):
+@onnx_op(op_type="Quant", inputs=[PyOp.dt_float,  PyOp.dt_float, PyOp.dt_int64, 
+                                  PyOp.dt_int64], 
+                            outputs=[PyOp.dt_float])
+def quant_activation_onnx(x, scale, n_levels, signed, zero_point=0.0):
     """
     Quantize weights for ONNX export.
 
@@ -51,25 +53,30 @@ def quant_activation_onnx(x, scale, n_levels, signed, **kwargs):
     signed = bool(signed)
     if signed and n_levels == 256:
         qmin, qmax = -2**7, 2**7-1
-        q_w = np.clip(np.round(x / scale), qmin, qmax).astype(np.int8)
+        q_w = np.clip(np.round((x + zero_point)/ scale), qmin, qmax).astype(np.int8)
 
     elif not signed and n_levels == 256:
         qmin, qmax = 0, 2**8-1
-        q_w = np.clip(np.round(x / scale), qmin, qmax).astype(np.uint8)
-
+        q_w = np.clip(np.round((x + zero_point) / scale), qmin, qmax).astype(np.uint8)
     elif signed and n_levels == 2**32:
         qmin, qmax = -2**31, 2**31-1
-        q_w = np.clip(np.round(x / scale), qmin, qmax).astype(np.int32)
+        q_w = np.clip(np.round((x + zero_point) / scale), qmin, qmax).astype(np.int32)
 
     elif not signed and n_levels == 2**32:
         qmin, qmax = 0, 2**32-1
-        q_w = np.clip(np.round(x / scale), qmin, qmax).astype(np.uint32)
+        q_w = np.clip(np.round((x + zero_point) / scale), qmin, qmax).astype(np.uint32)
+    
+    # special pass for fused ReLU
+    elif signed and n_levels ==128:
+        qmin, qmax = 0, 2**7-1
+        q_w = np.clip(np.round((x + zero_point) / scale), qmin, qmax).astype(np.uint8)
     else:
         raise ValueError(f"Unsupported combination of signed={signed} and n_levels={n_levels}")
     return q_w
 
 
-@onnx_op(op_type="Dequant", inputs=[PyOp.dt_float, PyOp.dt_float], outputs=[PyOp.dt_float])
+@onnx_op(op_type="Dequant", inputs=[PyOp.dt_float, PyOp.dt_float],
+                            outputs=[PyOp.dt_float])
 def dequant_onnx(q_x, scale, zero_point=0.0):
     """
     Dequantize tensor for ONNX export.
