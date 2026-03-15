@@ -14,12 +14,14 @@ import onnx
 from onnxruntime_extensions import get_library_path
 
 
-from DeepQuant.TransformQuant import move_agnostic_ops_after_quant, \
+from DeepQuant.TransformQuant import fuse_requant_shift_pattern, move_agnostic_ops_after_quant, \
                                     remove_intermediate_qdq_and_preserve_relu,\
                                     remove_trailing_qdq, \
                                     replace_mul_with_dequant_and_quant_pattern, \
                                     decompose_quant_dequant_nodes, \
-                                    rename_parameter_initializers
+                                    rename_parameter_initializers, \
+                                    simplify_quant_dequant_nodes
+
 from DeepQuant.Injects.Transformations import (
     LinearTransformation,  # Transformation for quantized linear layers (QuantLinear, QuantConv2d)
     ActivationTransformation,  # Transformation for quantized activation functions (QuantReLU, etc.)
@@ -267,10 +269,13 @@ def exportBrevitas(
     onnx_model = replace_mul_with_dequant_and_quant_pattern(onnx_model)  # Replace QDQ nodes with separate Quant and Dequant nodes
     onnx_model = move_agnostic_ops_after_quant(onnx_model)
     onnx_model = remove_intermediate_qdq_and_preserve_relu(onnx_model)  # Fuse consecutive Rescale-QDQ patterns into single nodes
+    onnx_model = fuse_requant_shift_pattern(onnx_model) # Fuse RequantShift patterns into single nodes for better optimization
     onnx_model = decompose_quant_dequant_nodes(onnx_model)  # Decompose complex quant-dequant patterns into simpler nodes
+
     onnx_model = rename_parameter_initializers(onnx_model)  # Ensure all initializers have unique names
+
     # onnx_model = remove_trailing_qdq(onnx_model)  # Remove unnecessary trailing QDQ nodes at the end of the graph
-    
+
     # # Test numerical consistency after ONNX transformations
     # input_scale = proxyParams['input']['scale'] if 'input' in proxyParams else 1.0
     # input_zero_point = proxyParams['input']['zero_point'] if 'input' in proxyParams else 0
@@ -283,51 +288,32 @@ def exportBrevitas(
     # input_q = np.clip(np.round(input_fp / input_scale + input_zero_point), qmin, qmax).astype(np.int8)
 
     # --- Run inference with ONNX Runtime ---
-    so = ort.SessionOptions()
-    so.register_custom_ops_library(get_library_path())  # Register custom ops from DeepQuant
-    ort_session = ort.InferenceSession(onnx_model.SerializeToString(), so, providers=["CPUExecutionProvider"])
-    ort_inputs = {"input": exampleInput.cpu().numpy()}
-    ort_output = ort_session.run(None, ort_inputs)[0]
-    
-    checked_output = np.allclose(ort_output, outputModel.cpu().numpy(), atol=1e-5)
-    if checked_output:
-        print(f"{BLUE} ✓ ONNX Runtime inference output is consistent with original model{ENDC}")
-    else:
-        print(f"{RED} ✗ ONNX Runtime inference output differs from original model{ENDC}")
-        ref_output = outputModel.cpu().numpy()
-        test_output = ort_output
+    # so = ort.SessionOptions()
+    # so.register_custom_ops_library(get_library_path())  # Register custom ops from DeepQuant
+    # ort_session = ort.InferenceSession(onnx_model.SerializeToString(), so, providers=["CPUExecutionProvider"])
+    # ort_inputs = {"input": exampleInput.cpu().numpy()}
+    # ort_output = ort_session.run(None, ort_inputs)[0]
 
-        # Save reference (PyTorch) output
-        with open("ref.txt", "w") as f:
-            np.savetxt("ref.txt", ref_output.flatten(), fmt="%.8f")
+    # checked_output = np.allclose(ort_output, outputModel.cpu().numpy(), atol=1e-5)
+    # if checked_output:
+    #     print(f"{BLUE} ✓ ONNX Runtime inference output is consistent with original model{ENDC}")
+    # else:
+    #     print(f"{RED} ✗ ONNX Runtime inference output differs from original model{ENDC}")
+    #     ref_output = outputModel.cpu().numpy()
+    #     test_output = ort_output
 
-        # Save test (ONNX Runtime) output
-        with open("test.txt", "w") as f:
-            np.savetxt("test.txt", test_output.flatten(), fmt="%.8f")
-        print(F"max diff: {np.max(np.abs(ort_output - outputModel.cpu().numpy()))}")
+    #     # Save reference (PyTorch) output
+    #     with open("ref.txt", "w") as f:
+    #         np.savetxt("ref.txt", ref_output.flatten(), fmt="%.8f")
+
+    #     # Save test (ONNX Runtime) output
+    #     with open("test.txt", "w") as f:
+    #         np.savetxt("test.txt", test_output.flatten(), fmt="%.8f")
+    #     print(F"max diff: {np.max(np.abs(ort_output - outputModel.cpu().numpy()))}")
         # raise RuntimeError("ONNX Runtime inference output differs from original model")  # Raise error if inconsistent
-    # 1) quantize the example input using the same quantization parameters as the model
-    # 2) run inference with ONNX Runtime
-    # 3) dequantize the output and compare with the original PyTorch output
-         
-    # inferredModel = onnx.shape_inference.infer_shapes(onnxModel)
 
-    # # Step 3: Save the model with inferred shapes
-    # onnx.save(inferredModel, onnxFile)
-
-    # inputFile: str = EXPORT_FOLDER / "inputs.npz"
-    # np.savez(inputFile, input=exampleInput.cpu())
-    # print("Input npz: ", exampleInput)
-    # print(f"Input data saved to {inputFile} ✓")
-
-    # # onnxruntime to run the exported model
-    # ortSession: ort.InferenceSession = ort.InferenceSession(onnxFile)
-    # ortInputs: dict = {"input": exampleInput.cpu().numpy()}
-    # ortOutput: np.ndarray = ortSession.run(None, ortInputs)[0]
-
-    # outputFile: str = EXPORT_FOLDER / "outputs.npz"
-    # np.savez(outputFile, output=ortOutput)
-    # print("Output npz: ", ortOutput)
-    # print(f"Output data saved to {outputFile} ✓")
+    # This pass does not make numerical changes, but can't be run with onnx runtime.
+    
+    # onnx_model = simplify_quant_dequant_nodes(onnx_model)  # Decompose complex quant-dequant patterns into simpler nodes
 
     return onnx_model  # Return the final optimized FX GraphModule

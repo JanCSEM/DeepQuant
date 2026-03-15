@@ -1,3 +1,4 @@
+from matplotlib import scale
 import numpy as np
 from onnxruntime_extensions import onnx_op, PyOp
 
@@ -53,23 +54,23 @@ def quant_activation_onnx(x, scale, n_levels, signed, zero_point=0.0):
     signed = bool(signed)
     if signed and n_levels == 256:
         qmin, qmax = -2**7, 2**7-1
-        q_w = np.clip(np.round((x + zero_point)/ scale), qmin, qmax).astype(np.int8)
+        q_w = np.clip(np.round(x / scale + zero_point), qmin, qmax).astype(np.int8)
 
     elif not signed and n_levels == 256:
         qmin, qmax = 0, 2**8-1
-        q_w = np.clip(np.round((x + zero_point) / scale), qmin, qmax).astype(np.uint8)
+        q_w = np.clip(np.round(x / scale + zero_point), qmin, qmax).astype(np.uint8)
     elif signed and n_levels == 2**32:
         qmin, qmax = -2**31, 2**31-1
-        q_w = np.clip(np.round((x + zero_point) / scale), qmin, qmax).astype(np.int32)
+        q_w = np.clip(np.round(x / scale + zero_point), qmin, qmax).astype(np.int32)
 
     elif not signed and n_levels == 2**32:
         qmin, qmax = 0, 2**32-1
-        q_w = np.clip(np.round((x + zero_point) / scale), qmin, qmax).astype(np.uint32)
+        q_w = np.clip(np.round(x / scale + zero_point), qmin, qmax).astype(np.uint32)
     
     # special pass for fused ReLU
     elif signed and n_levels ==128:
         qmin, qmax = 0, 2**7-1
-        q_w = np.clip(np.round((x + zero_point) / scale), qmin, qmax).astype(np.uint8)
+        q_w = np.clip(np.round(x / scale + zero_point), qmin, qmax).astype(np.uint8)
     else:
         raise ValueError(f"Unsupported combination of signed={signed} and n_levels={n_levels}")
     return q_w
@@ -89,3 +90,19 @@ def dequant_onnx(q_x, scale, zero_point=0.0):
         Dequantized tensor as numpy array
     """    
     return (q_x.astype(np.float32) - zero_point) * scale
+
+
+
+@onnx_op(op_type="RequantShift", inputs=[PyOp.dt_float, PyOp.dt_float, PyOp.dt_float, PyOp.dt_float, PyOp.dt_int64, PyOp.dt_int64, PyOp.dt_bool],
+                            outputs=[PyOp.dt_float])
+def requant_shift_onnx(q_x, mul, add, div, qmin, qmax, signed):
+
+    input_offset = 0
+    output_offset = 0
+    rounding = 1
+    log2D = int(np.log2(div))
+    intermediate = q_x + input_offset * mul + add
+    intermediate = ((intermediate + ((1 << (log2D - 1))) * rounding) >> log2D) + output_offset
+    out = np.clip(intermediate, qmin, qmax)
+
+    return out.astype(q_x.dtype)

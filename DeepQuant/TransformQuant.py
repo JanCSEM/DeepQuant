@@ -1,4 +1,5 @@
 # ...existing code...
+import math
 import onnx
 import onnx_graphsurgeon as gs
 import numpy as np
@@ -210,7 +211,7 @@ def move_agnostic_ops_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelProt
                     for k, inp in enumerate(consumer.inputs):
                         if inp == quant_node.outputs[0]:
                             consumer.inputs[k] = agnostic_op_node.outputs[0]
-                
+
 
             fusion_occured = True
             # A fusion has changed the graph. Break and restart the scan.
@@ -269,17 +270,18 @@ def replace_mul_with_dequant_and_quant_pattern(onnx_model: onnx.ModelProto) -> o
             # Determine signedness and number of levels
             signed = bool(clip_min_val < 0)
             n_levels = int(clip_max_val - clip_min_val + 1)
+            bitwidth = int(math.log2(n_levels)) if n_levels > 0 else 0
             # Create a new Quant node with the inferred attributes
             quant_node = gs.Node(
                 op="Quant",
                 name=clip_node.name + "_quant" if clip_node.name else "_quant",
                 # Inputs from Div, outputs from Clip
-                inputs=[node.inputs[0], 
-                        node.inputs[1], 
+                inputs=[node.inputs[0],
+                        node.inputs[1], # scale
                         gs.Constant(f"{clip_node.name}_n_levels", np.array(n_levels, dtype=np.int64)),
                         gs.Constant(f"{clip_node.name}_signed", np.array(int(signed), dtype=np.int64))                ],
                 outputs=clip_node.outputs,
-                attrs={"n_levels": n_levels, "signed": int(signed)},
+                attrs={"bit_width": bitwidth, "signed": int(signed)},
                 domain="ai.onnx.contrib"
             )
             nodes_to_add.append(quant_node)
@@ -369,11 +371,224 @@ def remove_intermediate_qdq_and_preserve_relu(onnx_model: onnx.ModelProto) -> on
     graph.cleanup().toposort()
     return gs.export_onnx(graph)
 
+def _find_producer_quant_node_recursively(var: gs.Variable, producers: dict) -> gs.Node | None:
+    """
+    Recursively searches backwards from a variable to find the producing Quant node,
+    skipping over quantization-agnostic operations.
+    """
+    if not isinstance(var, gs.Variable) or var.name not in producers:
+        return None
+
+    producer_node = producers[var.name]
+
+    if producer_node.op == "Quant":
+        return producer_node
+
+    else:
+        return _find_producer_quant_node_recursively(producer_node.inputs[0], producers)
+
+
+def simplify_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """
+    Simplifies custom Quant and Dequant nodes by moving quantization parameters
+    from inputs to node attributes. It also converts the 'n_levels' parameter
+    to 'bitwidth'.
+    """
+    graph = gs.import_onnx(onnx_model)
+    producers, _ = _build_maps(graph)
+
+    for node in list(graph.nodes):
+        if node.domain != "ai.onnx.contrib":
+            continue
+
+        # --- Simplify Dequant node ---
+        if node.op == "Dequant":
+            # Dequant(data, scale) -> Dequant(data) with scale and zero_point attributes
+            if len(node.inputs) > 1 and isinstance(node.inputs[1], gs.Constant):
+                scale_const = node.inputs[1]
+                node.attrs["scale"] = scale_const
+                node.attrs["zero_point"] = 0  # Add zero_point attribute
+
+                # Recursively find the preceding Quant node to get n_levels and signed status
+                producer_quant_node = _find_producer_quant_node_recursively(node.inputs[0], producers)
+
+                if producer_quant_node:
+                    bitwidth = producer_quant_node.attrs["bit_width"] if "bit_width" in producer_quant_node.attrs else None
+                    signed = producer_quant_node.attrs["signed"] if "signed" in producer_quant_node.attrs else None
+
+                    node.attrs["bit_width"] =  bitwidth
+                    node.attrs["signed"] = signed
+
+                # Keep only the data input
+                node.inputs = [node.inputs[0]]
+        # --- Simplify Quant node ---
+        elif node.op == "Quant":
+            # Quant(data, scale, n_levels, signed) -> Quant(data) with attributes
+            if len(node.inputs) > 3:
+                scale_const = node.inputs[1]
+                n_levels_const = node.inputs[2]
+                signed_const = node.inputs[3]
+
+                if all(isinstance(c, gs.Constant) for c in [scale_const, n_levels_const, signed_const]):
+                    # Move scale and signed to attributes
+                    node.attrs["scale"] = scale_const
+                    node.attrs["signed"] = bool(signed_const.values.item())
+                    node.attrs["zero_point"] = 0 # Add zero_point attribute
+
+                    # Convert n_levels to bitwidth and add as attribute
+                    n_levels = int(n_levels_const.values.item())
+                    bitwidth = int(np.log2(n_levels)) if n_levels > 0 else 0
+                    node.attrs["bit_width"] = bitwidth
+
+                    # Keep only the data input
+                    node.inputs = [node.inputs[0]]
+
+    graph.cleanup().toposort()
+    return gs.export_onnx(graph)
+
+def fuse_requant_shift_pattern(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """
+    Finds patterns like Conv/Gemm -> Dequant -> Quant and fuses the
+    Dequant -> Quant part into a single, custom RequantShift node.
+    """
+    graph = gs.import_onnx(onnx_model)
+    graph.fold_constants()
+
+    while True:
+        fusion_occured = False
+        for node in list(graph.nodes):
+            # --- Start pattern match: Find a linear op (Conv, Gemm, MatMul) ---
+            if node.op not in _LINEAR_OPS:
+                continue
+            linear_op_node = node
+
+            # --- Find the Dequant node ---
+            if not linear_op_node.outputs or len(linear_op_node.outputs[0].outputs) != 1:
+                continue
+            dequant_node = linear_op_node.outputs[0].outputs[0]
+            if dequant_node.op != "Dequant" or dequant_node.domain != "ai.onnx.contrib":
+                continue
+
+            # --- Find the Quant node ---
+            if not dequant_node.outputs or len(dequant_node.outputs[0].outputs) != 1:
+                continue
+            quant_node = dequant_node.outputs[0].outputs[0]
+            if quant_node.op != "Quant" or quant_node.domain != "ai.onnx.contrib":
+                continue
+
+            # --- Pattern Matched: LinearOp -> Dequant -> Quant ---
+
+            # --- Extract Parameters for RequantShift ---
+            if len(dequant_node.inputs) < 2 or not isinstance(dequant_node.inputs[1], gs.Constant):
+                continue
+            dequant_scale = dequant_node.inputs[1].values
+
+            if len(quant_node.inputs) < 2 or not isinstance(quant_node.inputs[1], gs.Constant):
+                continue
+            quant_scale = quant_node.inputs[1].values
+
+            output_zp = 0
+            if len(quant_node.inputs) > 3 and isinstance(quant_node.inputs[3], gs.Constant):
+                 is_signed = bool(quant_node.inputs[3].values.item())
+                 if not is_signed:
+                     output_zp = 0
+
+            # --- Calculate RequantShift parameters ---
+            # Effective scale for requantization
+            effective_scale = dequant_scale / quant_scale
+
+            if effective_scale.ndim > 0:
+                # Per-channel case: Find a single best shift for all channels.
+                # A good heuristic is to use the exponent of the maximum scale value
+                # to avoid overflow and preserve precision.
+                                
+                _, emax = np.frexp(np.max(effective_scale))
+                log2D = np.int64(31 - emax)
+                mul64 = np.round(effective_scale * (2.0 ** log2D)).astype(np.int64)
+
+                # Renormalize if any overflow (>= 2^31)
+                while np.any(mul64 >= (1 << 31)):
+                    mul64 >>= 1
+                    log2D -= 1
+
+                mul = mul64.astype(np.int32)
+
+                    
+                # debug prints
+                print(F"effective_scale: {effective_scale}")
+                print(F"log2D: {log2D}")
+                print(F"mul: {mul}")
+                print(f"max_exponent: {emax}")
+            else:
+                # Scalar case (original logic)
+                significand, exponent = np.frexp(effective_scale)
+                mul = np.round(significand * (2**31)).astype(np.int32)
+                log2D = 31 - exponent
+            # squeeze mul
+            if mul.shape and mul.shape[0] == 1:
+                mul = np.squeeze(mul, axis=0)
+                print(F"mul squeezed to : {mul}")
+            # Remove bias from Conv and put it here:
+            add = np.zeros_like(mul, dtype=np.int32)
+            if len(linear_op_node.inputs) > 2 and isinstance(linear_op_node.inputs[2], gs.Constant):
+                bias = linear_op_node.inputs[2].values.astype(np.float32)
+
+                add = np.round(bias.reshape(add.shape) * mul / 2.0**log2D).astype(np.int32)
+            
+                print(F"op: {linear_op_node.op}, mul shape: {mul.shape}")
+                if linear_op_node.op == "Conv" and add.ndim == 1:
+                    # Get the number of spatial dimensions from the 'kernel_shape' attribute
+                    spatial_dims = len(linear_op_node.inputs[1].shape) - 2  # weight shape is (out_channels, in_channels, *kernel_shape)
+                    new_shape = [add.shape[0]] + [1] * spatial_dims
+                    add = add.reshape(new_shape)
+                linear_op_node.inputs.pop(2)
+
+            # --- Create the new RequantShift node ---
+            
+            requant_input_var = linear_op_node.outputs[0]
+            final_output_var = quant_node.outputs[0]
+            final_output_var.shape = requant_input_var.shape
+            final_output_var.dtype = requant_input_var.dtype
+            requant_shift_node = gs.Node(
+                op="RequantShift",
+                name=f"{linear_op_node.name}_requant_shift",
+                domain="ai.onnx.contrib",
+                inputs=[
+                    requant_input_var,
+                    gs.Constant(f"{linear_op_node.name}_mul", np.array(mul, dtype=np.float32)),
+                    gs.Constant(f"{linear_op_node.name}_add", np.array(add, dtype=np.float32))
+                ],
+                outputs=[final_output_var],
+                attrs={
+                    "n_levels": gs.Constant(f"{linear_op_node.name}_n_levels", np.array([2**int(quant_node.attrs.get("bit_width", 0))], dtype=np.float32)),
+                    "signed": gs.Constant(f"{linear_op_node.name}_signed", np.array([quant_node.attrs.get("signed", 0)], dtype=np.float32)),
+                    "div": gs.Constant(f"{linear_op_node.name}_div", np.array(2**int(log2D), dtype=np.float32))
+                }
+               
+            )
+            if linear_op_node.op == "Conv":
+                if "auto_pad" in linear_op_node.attrs:
+                    del linear_op_node.attrs["auto_pad"]
+                linear_op_node.attrs["kernel_shape"] = linear_op_node.inputs[1].shape[2:]
+            graph.nodes.append(requant_shift_node)
+
+            dequant_node.outputs.clear()
+            quant_node.outputs.clear()
+
+            fusion_occured = True
+            break
+
+        if not fusion_occured:
+            break
+
+    graph.cleanup().toposort()
+    return gs.export_onnx(graph)
+
 def decompose_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
     """
     Decomposes custom Quant and Dequant nodes back into standard ONNX operators.
-    - Dequant(data, scale) -> Mul(data, scale)
-    - Quant(data, scale, n_levels, signed) -> Div -> Round -> Clip
+    - Dequant(data, scale, zp) -> Sub(data, zp) -> Mul(data, scale)
+    - Quant(data, scale, zp, n_levels, signed) -> Div -> Add -> Round -> Clip
     """
     graph = gs.import_onnx(onnx_model)
     nodes_to_add = []
@@ -386,12 +601,23 @@ def decompose_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProt
         # --- Decompose Dequant node ---
         if node.op == "Dequant":
             # Dequant(data, scale) -> Mul(data, scale)
+            # define new output variable for the Mul node
+            sub_out = gs.Variable(name=f"{node.name}_sub_out")
+            zp = gs.Constant(name=f"{node.name}_zero_point", values=np.array(0, dtype=np.float32))
+            sub_node = gs.Node(
+                op="Sub",
+                name=f"{node.name}_dequant_sub",
+                inputs=[node.inputs[0], zp],  # Inputs should be [data, zero_point]
+                outputs=[sub_out],
+
+            )
             mul_node = gs.Node(
                 op="Mul",
-                name=f"{node.name}_decomposed_mul",
-                inputs=node.inputs,  # Assumes inputs are [data, scale]
+                name=f"{node.name}_dequant_mul",
+                inputs=[sub_out, node.inputs[1]],  # Assumes inputs are [data, scale]
                 outputs=node.outputs
             )
+            nodes_to_add.append(sub_node)
             nodes_to_add.append(mul_node)
             nodes_to_remove.append(node)
 
@@ -422,16 +648,26 @@ def decompose_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProt
             div_output = gs.Variable(name=f"{node.name}_div_out")
             div_node = gs.Node(
                 op="Div",
-                name=f"{node.name}_decomposed_div",
+                name=f"{node.name}_quant_div",
                 inputs=[data_input, scale_input],
                 outputs=[div_output]
+            )
+
+            add_output = gs.Variable(name=f"{node.name}_add_out")
+            zp = gs.Constant(name=f"{node.name}_zero_point", values=np.array(0, dtype=np.float32))
+            add_node = gs.Node(
+                op="Add",
+                name=f"{node.name}_quant_add",
+                inputs=[div_output, zp],  # Inputs should be [data, zero_point]
+                outputs=[add_output],
+
             )
 
             round_output = gs.Variable(name=f"{node.name}_round_out")
             round_node = gs.Node(
                 op="Round",
-                name=f"{node.name}_decomposed_round",
-                inputs=[div_output],
+                name=f"{node.name}_quant_round",
+                inputs=[add_output],
                 outputs=[round_output]
             )
 
@@ -439,12 +675,12 @@ def decompose_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProt
             clip_max_const = gs.Constant(name=f"{node.name}_clip_max", values=np.array(clip_max, dtype=np.float32))
             clip_node = gs.Node(
                 op="Clip",
-                name=f"{node.name}_decomposed_clip",
+                name=f"{node.name}_quant_clip",
                 inputs=[round_output, clip_min_const, clip_max_const],
                 outputs=node.outputs  # Final output is the original Quant node's output
             )
 
-            nodes_to_add.extend([div_node, round_node, clip_node])
+            nodes_to_add.extend([div_node, add_node, round_node, clip_node])
             nodes_to_remove.append(node)
 
     # Add new nodes and remove old ones
