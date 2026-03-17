@@ -223,6 +223,230 @@ def move_agnostic_ops_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelProt
     graph.cleanup().toposort()
     return gs.export_onnx(graph)
 
+def restore_gelu_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """
+    Detects the standard GeLU decomposition subgraph and replaces it with a single GeLU node.
+    """
+    graph = gs.import_onnx(onnx_model)
+    graph.fold_constants()
+
+    fusion_occured = True
+    print(f"Starting GeLU restoration pass...")
+    while fusion_occured:
+        fusion_occured = False
+        for node in list(graph.nodes):
+            # Stage 1: Find Mul node with two variable inputs
+            if node.op != "Mul":
+                continue
+            mul_inputs = node.inputs
+            if len(mul_inputs) != 2 or not all(isinstance(inp, gs.Variable) for inp in mul_inputs):
+                continue
+
+            # Identify mul_x and mul_const (mul_const is output of Mul with constant 0.5)
+            mul_x, mul_const = mul_inputs
+            mul_const_node = mul_const.inputs[0] if mul_const.inputs and mul_const.inputs[0].op == "Mul" else None
+            if not mul_const_node:
+                continue
+
+            # Check mul_const_node has constant 0.5 input and Add input
+            if len(mul_const_node.inputs) != 2:
+                continue
+            if not any(isinstance(inp, gs.Constant) and np.allclose(inp.values, 0.5, atol=1e-6) for inp in mul_const_node.inputs):
+                continue
+            add_var = [inp for inp in mul_const_node.inputs if isinstance(inp, gs.Variable)][0]
+            add_node = add_var.inputs[0] if add_var.inputs and add_var.inputs[0].op == "Add" else None
+            if not any(isinstance(inp, gs.Constant) and np.allclose(inp.values, 1.0, atol=1e-6) for inp in add_node.inputs):
+                continue
+            if not add_node:
+                continue
+            # Add node: inputs are Erf output and constant 1.0
+            if len(add_node.inputs) != 2:
+                continue
+            
+            print(F"found add node in GeLu pattern")
+
+            erf_var = [inp for inp in add_node.inputs if isinstance(inp, gs.Variable)][0]
+            erf_node = erf_var.inputs[0]  if erf_var.inputs and erf_var.inputs[0].op == "Erf" else None
+            if not erf_node:
+                continue
+            print(F"found erf node in GeLu pattern")
+
+            # Erf node input: output of Div node
+            div_var = [inp for inp in erf_node.inputs if isinstance(inp, gs.Variable)][0]
+            div_node = div_var.inputs[0] if div_var.inputs and div_var.inputs[0].op == "Div" else None
+            # Div node: input is mul_x and const
+            if not div_node:
+                continue
+            if len(div_node.inputs) != 2:
+                continue
+            print(F"found div node in GeLu pattern")
+            # Confirm mul_x is used throughout the pattern
+            if not any(inp.name == mul_x.name for inp in div_node.inputs):
+                continue
+
+            # Pattern matched: Replace with GeLU node
+            print(f"Restoring GeLU: replacing {node.name} with GeLU({mul_x.name})")
+            gelu_node = gs.Node(
+                op="Gelu",
+                name=f"restored_gelu_{node.name}",
+                inputs=[mul_x],
+                outputs=node.outputs,
+                domain="",  # Standard domain
+            )
+            graph.nodes.append(gelu_node)
+            # Disconnect all nodes in the matched GeLU subgraph to prevent re-matching
+            for n in [node, mul_const_node, add_node, erf_node, div_node]:
+                if n is not None:
+                    n.outputs.clear()
+            fusion_occured = True
+            break
+
+    graph.cleanup().toposort()
+    return gs.export_onnx(graph)
+
+def merge_consecutive_divs(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """
+    Detects two consecutive Div nodes with constant divisors and merges them into one Div node
+    with the divisor equal to the product of both initializers.
+    """
+    graph = gs.import_onnx(onnx_model)
+    graph.fold_constants()
+
+    fusion_occured = True
+    while fusion_occured:
+        fusion_occured = False
+        for node in list(graph.nodes):
+            if node.op != "Div":
+                continue
+            # Check if output feeds into another Div node
+            if not node.outputs or len(node.outputs[0].outputs) != 1:
+                continue
+            next_node = node.outputs[0].outputs[0]
+            if next_node.op != "Div":
+                continue
+            # Both divisors must be constants
+            if len(node.inputs) < 2 or len(next_node.inputs) < 2:
+                continue
+            divisor1 = node.inputs[1]
+            divisor2 = next_node.inputs[1]
+            if not isinstance(divisor1, gs.Constant) or not isinstance(divisor2, gs.Constant):
+                continue
+            # Merge: new divisor is product of both
+            merged_divisor = gs.Constant(
+                name=f"{node.name}_merged_divisor",
+                values=np.array(divisor1.values * divisor2.values)
+            )
+            # Create new Div node
+            merged_div_node = gs.Node(
+                op="Div",
+                name=f"{node.name}_merged",
+                inputs=[node.inputs[0], merged_divisor],
+                outputs=next_node.outputs
+            )
+            graph.nodes.append(merged_div_node)
+            # Disconnect old nodes
+            node.outputs.clear()
+            next_node.outputs.clear()
+            fusion_occured = True
+            break
+
+    graph.cleanup().toposort()
+    return gs.export_onnx(graph)
+
+def move_special_nodes_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """
+    Moves Reshape and Transpose nodes that are between Dequant and Quant to after the Quant node.
+    Pattern: Dequant -> (Reshape|Transpose)* -> Quant
+    Transforms to: Dequant -> Quant -> (Reshape|Transpose)*
+    """
+    graph = gs.import_onnx(onnx_model)
+    graph.fold_constants()
+
+    while True:
+        fusion_occured = False
+        for node in list(graph.nodes):
+            # --- Start pattern match: Find a linear op (Conv, Gemm, MatMul) ---
+            if node.op not in _LINEAR_OPS:
+                continue
+            linear_op_node = node
+            add_node = None
+            
+            # --- New Transformer Pattern: MatMul -> Add ---
+            # If we find a MatMul, check if its single consumer is an Add node.
+            if node.op == "MatMul" and node.outputs and len(node.outputs[0].outputs) == 1:
+                maybe_add_node = node.outputs[0].outputs[0]
+                # The Add node must have a constant bias term.
+                if maybe_add_node.op == "Add" and len(maybe_add_node.inputs) > 1 and _is_const(maybe_add_node.inputs[1]):
+                    add_node = maybe_add_node
+                    print(f"Found MatMul->Add pattern: {linear_op_node.name} -> {add_node.name}")
+
+            # The node that feeds into the Dequant node is either the Add node or the original linear op.
+            effective_linear_op = add_node if add_node else linear_op_node
+            
+            print(f"Found linear op: {effective_linear_op.op}, name: {effective_linear_op.name}")            # --- Find the Dequant node ---
+            if not effective_linear_op.outputs or len(effective_linear_op.outputs[0].outputs) != 1:
+                continue
+            
+            # -- Find the Dequant node
+            dequant_node = effective_linear_op.outputs[0].outputs[0]
+            if dequant_node.op != "Dequant" or dequant_node.domain != "ai.onnx.contrib":
+                continue
+            print(f"Found dequant op: {dequant_node.op}, name: {dequant_node.name}")
+
+            # Traverse through Reshape/Transpose nodes
+            special_nodes = []
+            next_node = dequant_node
+            reroute = False
+            while True:
+                if not next_node.outputs or len(next_node.outputs[0].outputs) != 1:
+                    break
+                candidate = next_node.outputs[0].outputs[0]
+                
+                if candidate.op in {"Reshape", "Transpose"}:
+                    print(F"Moving node after Quant: {candidate.op}, name: {candidate.name}")
+
+                    special_nodes.append(candidate)
+                    next_node = candidate
+                    reroute = True
+                else:
+                    break
+
+            if reroute:
+                print(F"rerouting: {effective_linear_op.name} -> {dequant_node.name} -> {[n.name for n in special_nodes]} -> Quant")
+                # Find Quant node after the last special node
+                quant_node = next_node.outputs[0].outputs[0] if next_node.outputs and len(next_node.outputs[0].outputs) == 1 else None
+                if not quant_node or quant_node.op != "Quant":
+                    continue
+
+                # Pattern matched: Dequant -> (Reshape|Transpose)* -> Quant
+                # Move special nodes after Quant
+
+                # 1. Quant node's input should be Dequant's output
+                quant_node.inputs[0] = dequant_node.outputs[0]
+
+                # 2. Each special node's input should be Quant's output (for the first), or previous special node's output
+                prev_output = quant_node.outputs[0]
+                for special_node in special_nodes:
+                    special_node.inputs[0] = prev_output
+                    prev_output = special_node.outputs[0]
+
+                # 3. Reroute all consumers of Quant's output to the first special node's output (if any special nodes)
+                if special_nodes:
+                    for consumer in quant_node.outputs[0].outputs:
+                        for k, inp in enumerate(consumer.inputs):
+                            if inp == quant_node.outputs[0]:
+                                consumer.inputs[k] = special_nodes[0].outputs[0]
+
+                fusion_occured = True
+                break
+
+        if not fusion_occured:
+            break
+
+    graph.cleanup().toposort()
+    return gs.export_onnx(graph)
+
+
 def replace_mul_with_dequant_and_quant_pattern(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
     """
     Replace (mul) with custom Dequant, and (div+round+clip) with custom Quant nodes.
@@ -446,6 +670,80 @@ def simplify_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProto
     graph.cleanup().toposort()
     return gs.export_onnx(graph)
 
+def replace_matmul_add_by_gemm(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """
+    Finds the pattern MatMul -> Add and replaces it with a single Gemm node.
+    This is a common pattern in transformer models for linear layers.
+    """
+    graph = gs.import_onnx(onnx_model)
+    graph.fold_constants()
+
+    while True:
+        fusion_occured = False
+        for node in list(graph.nodes):
+            # --- Start pattern match: Find a MatMul node ---
+            if node.op != "MatMul":
+                continue
+
+            # The MatMul output must have exactly one consumer.
+            if not node.outputs or len(node.outputs[0].outputs) != 1:
+                continue
+            
+            # --- Find the Add node ---
+            add_node = node.outputs[0].outputs[0]
+            if add_node.op != "Add":
+                continue
+
+            # --- Check for constant weights and biases ---
+            # MatMul must have a constant weight tensor (input B)
+            if len(node.inputs) < 2 or not _is_const(node.inputs[1]):
+                continue
+            
+            # Add must have a constant bias tensor
+            bias_input = None
+            for inp in add_node.inputs:
+                if _is_const(inp):
+                    bias_input = inp
+                    break
+            if bias_input is None:
+                continue
+
+            # --- Pattern Matched: MatMul(A, B) -> Add(C, D) ---
+            print(f"Fusing pattern: MatMul({node.name}) -> Add({add_node.name})")
+
+            # --- Create the new Gemm node ---
+            # Inputs: A (from MatMul), B (from MatMul), C (from Add)
+            gemm_inputs = [node.inputs[0], node.inputs[1], bias_input]
+            
+            # Output: The original output of the Add node
+            gemm_outputs = add_node.outputs
+            
+            gemm_node = gs.Node(
+                op="Gemm",
+                name=f"{node.name}_gemm",
+                inputs=gemm_inputs,
+                outputs=gemm_outputs
+            )
+            
+            # Add the new node to the graph
+            graph.nodes.append(gemm_node)
+
+            # --- Clean up the old nodes ---
+            # Disconnect the old nodes so they can be removed by cleanup
+            node.outputs.clear()
+            add_node.outputs.clear()
+
+            fusion_occured = True
+            # A fusion has changed the graph. Break and restart the scan.
+            break
+
+        if not fusion_occured:
+            break
+
+    # Remove the old, disconnected nodes and re-sort the graph
+    graph.cleanup().toposort()
+    return gs.export_onnx(graph)
+
 def fuse_requant_shift_pattern(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
     """
     Finds patterns like Conv/Gemm -> Dequant -> Quant and fuses the
@@ -461,20 +759,35 @@ def fuse_requant_shift_pattern(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
             if node.op not in _LINEAR_OPS:
                 continue
             linear_op_node = node
+            add_node = None
+            
+            # --- New Transformer Pattern: MatMul -> Add ---
+            # If we find a MatMul, check if its single consumer is an Add node.
+            if node.op == "MatMul" and node.outputs and len(node.outputs[0].outputs) == 1:
+                maybe_add_node = node.outputs[0].outputs[0]
+                # The Add node must have a constant bias term.
+                if maybe_add_node.op == "Add" and len(maybe_add_node.inputs) > 1 and _is_const(maybe_add_node.inputs[1]):
+                    add_node = maybe_add_node
+                    print(f"Found MatMul->Add pattern: {linear_op_node.name} -> {add_node.name}")
 
-            # --- Find the Dequant node ---
-            if not linear_op_node.outputs or len(linear_op_node.outputs[0].outputs) != 1:
+            # The node that feeds into the Dequant node is either the Add node or the original linear op.
+            effective_linear_op = add_node if add_node else linear_op_node
+            
+            print(f"Found linear op: {effective_linear_op.op}, name: {effective_linear_op.name}")            # --- Find the Dequant node ---
+            if not effective_linear_op.outputs or len(effective_linear_op.outputs[0].outputs) != 1:
                 continue
-            dequant_node = linear_op_node.outputs[0].outputs[0]
+            
+            # -- Find the Dequant node
+            dequant_node = effective_linear_op.outputs[0].outputs[0]
             if dequant_node.op != "Dequant" or dequant_node.domain != "ai.onnx.contrib":
                 continue
+            print(f"Found dequant op: {dequant_node.op}, name: {dequant_node.name}")
 
             # --- Find the Quant node ---
-            if not dequant_node.outputs or len(dequant_node.outputs[0].outputs) != 1:
+            quant_node = dequant_node.outputs[0].outputs[0] if dequant_node.outputs and len(dequant_node.outputs[0].outputs) == 1 else None
+            if not quant_node or quant_node.op != "Quant" or quant_node.domain != "ai.onnx.contrib":
                 continue
-            quant_node = dequant_node.outputs[0].outputs[0]
-            if quant_node.op != "Quant" or quant_node.domain != "ai.onnx.contrib":
-                continue
+            print(f"Found Quant op: {dequant_node.op}, name: {dequant_node.name}")
 
             # --- Pattern Matched: LinearOp -> Dequant -> Quant ---
 
@@ -503,7 +816,7 @@ def fuse_requant_shift_pattern(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
                 # to avoid overflow and preserve precision.
                                 
                 _, emax = np.frexp(np.max(effective_scale))
-                log2D = np.int64(31 - emax)
+                log2D = np.int64(15 - emax)
                 mul64 = np.round(effective_scale * (2.0 ** log2D)).astype(np.int64)
 
                 # Renormalize if any overflow (>= 2^31)
@@ -513,35 +826,35 @@ def fuse_requant_shift_pattern(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
 
                 mul = mul64.astype(np.int32)
 
-                    
                 # debug prints
-                print(F"effective_scale: {effective_scale}")
-                print(F"log2D: {log2D}")
-                print(F"mul: {mul}")
-                print(f"max_exponent: {emax}")
+                # print(F"effective_scale: {effective_scale}")
+                # print(F"log2D: {log2D}")
+                # print(F"mul: {mul}")
+                # print(f"max_exponent: {emax}")
             else:
                 # Scalar case (original logic)
                 significand, exponent = np.frexp(effective_scale)
-                mul = np.round(significand * (2**31)).astype(np.int32)
-                log2D = 31 - exponent
+                mul = np.round(significand * (2**15)).astype(np.int32)
+                log2D = 15 - exponent
             # squeeze mul
             if mul.shape and mul.shape[0] == 1:
                 mul = np.squeeze(mul, axis=0)
-                print(F"mul squeezed to : {mul}")
-            # Remove bias from Conv and put it here:
+                
+            # --- Handle Bias ---
+            # Remove bias from Conv/Gemm or take it from the separate Add node.
             add = np.zeros_like(mul, dtype=np.int32)
-            if len(linear_op_node.inputs) > 2 and isinstance(linear_op_node.inputs[2], gs.Constant):
-                bias = linear_op_node.inputs[2].values.astype(np.float32)
-
-                add = np.round(bias.reshape(add.shape) * mul / 2.0**log2D).astype(np.int32)
+            bias_source_node = add_node if add_node else linear_op_node
             
-                print(F"op: {linear_op_node.op}, mul shape: {mul.shape}")
-                if linear_op_node.op == "Conv" and add.ndim == 1:
-                    # Get the number of spatial dimensions from the 'kernel_shape' attribute
-                    spatial_dims = len(linear_op_node.inputs[1].shape) - 2  # weight shape is (out_channels, in_channels, *kernel_shape)
-                    new_shape = [add.shape[0]] + [1] * spatial_dims
-                    add = add.reshape(new_shape)
-                linear_op_node.inputs.pop(2)
+            # Check for bias on the source node (Conv, Gemm, or Add)
+            if len(bias_source_node.inputs) > 1 and _is_const(bias_source_node.inputs[1 if add_node else 2]):
+                bias_input_index = 1 if add_node else 2
+                bias = bias_source_node.inputs[bias_input_index].values.astype(np.float32)
+                
+                # The bias is scaled by the requant multiplier 'mul'
+                add = (mul * bias.reshape(add.shape)).astype(np.int32)
+                
+                # Remove the original bias input
+                bias_source_node.inputs.pop(bias_input_index)
 
             # --- Create the new RequantShift node ---
             
@@ -555,8 +868,8 @@ def fuse_requant_shift_pattern(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
                 domain="ai.onnx.contrib",
                 inputs=[
                     requant_input_var,
-                    gs.Constant(f"{linear_op_node.name}_mul", np.array(mul, dtype=np.float32)),
-                    gs.Constant(f"{linear_op_node.name}_add", np.array(add, dtype=np.float32))
+                    gs.Constant(f"{linear_op_node.name}_mul", np.array(np.squeeze(mul), dtype=np.float32)),
+                    gs.Constant(f"{linear_op_node.name}_add", np.array(np.squeeze(add), dtype=np.float32))
                 ],
                 outputs=[final_output_var],
                 attrs={
@@ -602,7 +915,8 @@ def decompose_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProt
         if node.op == "Dequant":
             # Dequant(data, scale) -> Mul(data, scale)
             # define new output variable for the Mul node
-            sub_out = gs.Variable(name=f"{node.name}_sub_out")
+            sub_out = gs.Variable(name=f"{node.name}_sub_out", dtype=onnx.TensorProto.FLOAT, 
+                                  shape=node.inputs[0].shape)
             zp = gs.Constant(name=f"{node.name}_zero_point", values=np.array(0, dtype=np.float32))
             sub_node = gs.Node(
                 op="Sub",
@@ -645,7 +959,8 @@ def decompose_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProt
                 clip_max = n_levels - 1
 
             # --- Create the new node chain ---
-            div_output = gs.Variable(name=f"{node.name}_div_out")
+            div_output = gs.Variable(name=f"{node.name}_div_out", 
+                                     dtype=onnx.TensorProto.FLOAT, shape=data_input.shape)
             div_node = gs.Node(
                 op="Div",
                 name=f"{node.name}_quant_div",
@@ -653,7 +968,8 @@ def decompose_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProt
                 outputs=[div_output]
             )
 
-            add_output = gs.Variable(name=f"{node.name}_add_out")
+            add_output = gs.Variable(name=f"{node.name}_add_out", dtype=onnx.TensorProto.FLOAT,
+                                     shape=data_input.shape)
             zp = gs.Constant(name=f"{node.name}_zero_point", values=np.array(0, dtype=np.float32))
             add_node = gs.Node(
                 op="Add",
@@ -663,7 +979,8 @@ def decompose_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProt
 
             )
 
-            round_output = gs.Variable(name=f"{node.name}_round_out")
+            round_output = gs.Variable(name=f"{node.name}_round_out",
+                                        dtype=onnx.TensorProto.FLOAT, shape=data_input.shape)
             round_node = gs.Node(
                 op="Round",
                 name=f"{node.name}_quant_round",

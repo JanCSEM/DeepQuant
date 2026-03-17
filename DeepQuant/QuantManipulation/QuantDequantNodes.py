@@ -144,7 +144,15 @@ class Dequant(nn.Module):
             elif len(x.shape) != len(self.scale.shape)and len(x.shape) == 3:
                 # Handle per-channel quantization for RNN layers
                 # Assuming scale shape is (C_out,) and x shape is (N, C_out, T)
-                self.scale = self.scale.view(1, -1, 1)
+                if x.shape[1] == self.scale.shape[0]:
+                    # Shape is likely (N, C, T)
+                    self.scale = self.scale.view(1, -1, 1)
+                elif x.shape[2] == self.scale.shape[0]:
+                    # Shape is likely (N, T, C)
+                    self.scale = self.scale.view(1, 1, -1)
+                else:
+                    raise ValueError(f"Cannot determine channel dimension for 3D dequantization: x shape {x.shape}, scale shape {self.scale.shape}")
+
                 
             elif len(x.shape) != len(self.scale.shape) and len(x.shape) == 2:
                 # Handle per-channel quantization for linear layers
