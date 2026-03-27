@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 name = "DeepQuant"
 version = "0.1.0"
 description = "Brevitas model export utility for quantized networks"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 authors = [
     {name = "Victor J.B. Jung", email = "jungvi@iis.ee.ethz.ch"},
     {name = "Federico Brancasi", email = "fbrancasi@ethz.ch"},
@@ -52,7 +52,7 @@ filterwarnings = [
 
 [tool.black]
 line-length = 88
-target-version = ["py311"]
+target-version = ["py310"]
 
 [tool.isort]
 profile = "black"

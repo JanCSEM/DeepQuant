@@ -103,37 +103,6 @@ def _match_quant_from_var(var: gs.Variable, producers) -> tuple | None:
 
     return div, add, rnd, clip, src
 
-
-def _strip_qdq_backwards(var: gs.Variable, producers, nodes_to_drop_ids: set) -> gs.Variable:
-    """
-    Repeatedly strip trailing quant or dequant producers from var.
-    """
-    cur = var
-    changed = True
-    while changed:
-        changed = False
-
-        # Strip quant chain
-        q = _match_quant_from_var(cur, producers)
-        if q is not None:
-            div, add, rnd, clip, src = q
-            _mark_drop(nodes_to_drop_ids, div, add, rnd, clip)
-            cur = src
-            changed = True
-            continue
-
-        # Strip dequant
-        p = producers.get(cur.name)
-        if _is_mul_dequant(p):
-            src = _non_const_input(p)
-            if src is not None:
-                _mark_drop(nodes_to_drop_ids, p)
-                cur = src
-                changed = True
-                continue
-
-    return cur
-
 def rename_parameter_initializers(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
     """
     Renames the initializers (weights and biases) of parameterizable layers
