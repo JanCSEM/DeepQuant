@@ -291,7 +291,7 @@ def restore_gelu_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
                 name=f"restored_gelu_{node.name}",
                 inputs=[mul_x],
                 outputs=node.outputs,
-                domain="",  # Standard domain
+                domain="com.microsoft"
             )
             graph.nodes.append(gelu_node)
             # Disconnect all nodes in the matched GeLU subgraph to prevent re-matching
@@ -302,6 +302,29 @@ def restore_gelu_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
             break
 
     graph.cleanup().toposort()
+    return gs.export_onnx(graph)
+
+def fix_squeeze_axes_inputs(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """
+    Converts Squeeze nodes with 'axes' attribute to use 'axes' as an input tensor (for opset >= 13).
+    """
+    graph = gs.import_onnx(onnx_model)
+    changed = False
+
+    for node in graph.nodes:
+        if node.op == "Squeeze" and "axes" in node.attrs:
+            axes = node.attrs.pop("axes")
+            # Insert axes as a Constant input tensor
+            axes_tensor = gs.Constant(name=f"{node.name}_axes", values=np.array(axes, dtype=np.int64))
+            # If Squeeze already has 2 inputs, replace the second; else, append
+            if len(node.inputs) == 1:
+                node.inputs.append(axes_tensor)
+            else:
+                node.inputs[1] = axes_tensor
+            changed = True
+
+    if changed:
+        graph.cleanup().toposort()
     return gs.export_onnx(graph)
 
 def merge_consecutive_divs(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
@@ -383,7 +406,6 @@ def move_special_nodes_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelPro
             # The node that feeds into the Dequant node is either the Add node or the original linear op.
             effective_linear_op = add_node if add_node else linear_op_node
             
-            print(f"Found linear op: {effective_linear_op.op}, name: {effective_linear_op.name}")            # --- Find the Dequant node ---
             if not effective_linear_op.outputs or len(effective_linear_op.outputs[0].outputs) != 1:
                 continue
             
@@ -391,7 +413,6 @@ def move_special_nodes_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelPro
             dequant_node = effective_linear_op.outputs[0].outputs[0]
             if dequant_node.op != "Dequant" or dequant_node.domain != "ai.onnx.contrib":
                 continue
-            print(f"Found dequant op: {dequant_node.op}, name: {dequant_node.name}")
 
             # Traverse through Reshape/Transpose nodes
             special_nodes = []
@@ -403,7 +424,6 @@ def move_special_nodes_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelPro
                 candidate = next_node.outputs[0].outputs[0]
                 
                 if candidate.op in {"Reshape", "Transpose"}:
-                    print(F"Moving node after Quant: {candidate.op}, name: {candidate.name}")
 
                     special_nodes.append(candidate)
                     next_node = candidate
@@ -417,7 +437,7 @@ def move_special_nodes_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelPro
                 quant_node = next_node.outputs[0].outputs[0] if next_node.outputs and len(next_node.outputs[0].outputs) == 1 else None
                 if not quant_node or quant_node.op != "Quant":
                     continue
-
+                
                 # Pattern matched: Dequant -> (Reshape|Transpose)* -> Quant
                 # Move special nodes after Quant
 
@@ -435,8 +455,10 @@ def move_special_nodes_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelPro
                     for consumer in quant_node.outputs[0].outputs:
                         for k, inp in enumerate(consumer.inputs):
                             if inp == quant_node.outputs[0]:
-                                consumer.inputs[k] = special_nodes[0].outputs[0]
+                                consumer.inputs[k] = special_nodes[-1].outputs[0]
 
+                # check new chain:
+                print(F"new chain: {effective_linear_op.name} -> {dequant_node.name} -> {quant_node.name} -> {[n.name for n in special_nodes]} -> consumers: {[c.name for c in quant_node.outputs[0].outputs]}")
                 fusion_occured = True
                 break
 
@@ -892,6 +914,111 @@ def fuse_requant_shift_pattern(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
             break
 
         if not fusion_occured:
+            break
+
+    graph.cleanup().toposort()
+    return gs.export_onnx(graph)
+
+def fuse_integer_matmul_with_requant(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """
+    Fuses patterns of quantized integer MatMul followed by Dequant into
+    IntegerMatMul -> RequantShift -> Dequant.
+    """
+    graph = gs.import_onnx(onnx_model)
+    graph.fold_constants()
+
+    fusion_occured = True
+    print(f"Starting fusion of Integer MatMul with RequantShift...")
+    while fusion_occured:
+        fusion_occured = False
+        for node in list(graph.nodes):
+            # 1. Find MatMul node with both inputs from Dequant
+            if node.op != "MatMul":
+                continue
+            if len(node.inputs) != 2:
+                continue
+            dequant_a, dequant_b = node.inputs
+            if not (isinstance(dequant_a, gs.Variable) and isinstance(dequant_b, gs.Variable)):
+                continue
+            if not (dequant_a.inputs and dequant_a.inputs[0].op == "Dequant"):
+                continue
+            if not (dequant_b.inputs and dequant_b.inputs[0].op == "Dequant"):
+                continue
+            dequant_node_a = dequant_a.inputs[0]
+            dequant_node_b = dequant_b.inputs[0]
+
+            print(F"found MatMul with Dequant inputs: {node.name}, {dequant_node_a.name}, {dequant_node_b.name}")
+            # # 2. Check both Dequant nodes are fed by Quant nodes
+            # if not (dequant_node_a.inputs and dequant_node_a.inputs[0].inputs and dequant_node_a.inputs[0].inputs[0].op == "Quant"):
+            #     continue
+            # if not (dequant_node_b.inputs and dequant_node_b.inputs[0].inputs and dequant_node_b.inputs[0].inputs[0].op == "Quant"):
+            #     continue
+            quant_node_a = dequant_node_a.inputs[0].inputs[0]
+            quant_node_b = dequant_node_b.inputs[0].inputs[0]
+
+            # 3. Replace with IntegerMatMul -> RequantShift -> Dequant
+            # (You may need to adjust input/output dtypes and attributes as needed)
+            int_matmul_out = gs.Variable(name=f"{node.name}_int_matmul_out", dtype=np.int32, shape=node.outputs[0].shape)
+            int_matmul_node = gs.Node(
+                op="MatMul",
+                name=f"{node.name}_int",
+                inputs=[quant_node_a.outputs[0], quant_node_b.outputs[0]],
+                outputs=[int_matmul_out]
+            )
+            # Dummy RequantShift parameters (replace with correct scale/bias computation)
+            
+            scale_a = dequant_node_a.inputs[1].values if len(dequant_node_a.inputs) > 1 else None
+            scale_b = dequant_node_b.inputs[1].values if len(dequant_node_b.inputs) > 1 else None
+            if scale_a is None or scale_b is None:
+                continue
+
+            # Compute effective scale for requantization (tensor-wise)
+            effective_scale = scale_a * scale_b
+            
+            _, emax = np.frexp(np.max(effective_scale))
+            log2D = np.int64(15 - emax)
+            mul64 = np.round(effective_scale * (2.0 ** log2D)).astype(np.int64)
+
+            # Renormalize if any overflow (>= 2^31)
+            while np.any(mul64 >= (1 << 31)):
+                mul64 >>= 1
+                log2D -= 1
+
+            mul_val = mul64.astype(np.int32)
+            shape_dequant_b = dequant_node_b.inputs[0].shape
+            mul = gs.Constant(f"{node.name}_mul", np.array([mul_val]*shape_dequant_b[2], dtype=np.float32))
+            add = gs.Constant(f"{node.name}_add", np.zeros_like([mul_val]*shape_dequant_b[2], dtype=np.float32))
+            
+            requant_out = gs.Variable(name=f"{node.name}_requant_out", dtype=np.int32, shape=int_matmul_out.shape)
+            requant_node = gs.Node(
+                op="RequantShift",
+                name=f"{node.name}_requant",
+                domain="ai.onnx.contrib",
+                inputs=[int_matmul_out, mul, add],
+                outputs=[requant_out],
+                attrs={
+                    "n_levels": gs.Constant(f"{node.name}__n_levels", np.array([2**int(8)], dtype=np.float32)),
+                    "signed": gs.Constant(f"{node.name}_signed", np.array([1], dtype=np.float32)),
+                    "div": gs.Constant(f"{node.name}_div", np.array(2**int(log2D), dtype=np.float32))
+                }
+            )
+            # Dequant node
+            scale = gs.Constant(f"{node.name}_scale", np.array([effective_scale], dtype=np.float32))
+            dequant_out = gs.Variable(name=f"{node.name}_dequant_out", dtype=np.float32)
+            dequant_node = gs.Node(
+                op="Dequant",
+                name=f"{node.name}_dequant",
+                domain="ai.onnx.contrib",
+                inputs=[requant_out, scale],
+                outputs=node.outputs
+            )
+
+            graph.nodes.extend([int_matmul_node, requant_node, dequant_node])
+            node.outputs.clear()
+            node.outputs.clear()
+            dequant_node_a.outputs.clear()
+            dequant_node_b.outputs.clear()
+            fusion_occured = True
             break
 
     graph.cleanup().toposort()

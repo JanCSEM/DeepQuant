@@ -13,7 +13,7 @@ import onnxruntime as ort
 import onnx
 from onnxruntime_extensions import get_library_path
 
-from DeepQuant.TransformQuant import fuse_requant_shift_pattern, move_agnostic_ops_after_quant, \
+from DeepQuant.TransformQuant import fuse_integer_matmul_with_requant, fuse_requant_shift_pattern, move_agnostic_ops_after_quant, \
                                     remove_intermediate_qdq_and_preserve_relu,\
                                     remove_trailing_qdq, \
                                     replace_mul_with_dequant_and_quant_pattern, \
@@ -22,7 +22,8 @@ from DeepQuant.TransformQuant import fuse_requant_shift_pattern, move_agnostic_o
                                     simplify_quant_dequant_nodes, \
                                     move_special_nodes_after_quant, \
                                     merge_consecutive_divs, \
-                                    restore_gelu_nodes
+                                    restore_gelu_nodes, \
+                                    fix_squeeze_axes_inputs
 
 from DeepQuant.Injects.Transformations import (
     LinearTransformation,  # Transformation for quantized linear layers (QuantLinear, QuantConv2d)
@@ -260,9 +261,10 @@ def exportBrevitas(
     onnx_model = remove_intermediate_qdq_and_preserve_relu(onnx_model)  # Fuse consecutive Rescale-QDQ patterns into single nodes
     onnx_model = move_special_nodes_after_quant(onnx_model)  # Move special nodes (e.g., ReLU) after quantization nodes where possible for better optimization
     onnx_model = fuse_requant_shift_pattern(onnx_model) # Fuse RequantShift patterns into single nodes for better optimization
+    onnx_model = fuse_integer_matmul_with_requant(onnx_model)  # Fuse integer MatMul with Requantize patterns
     onnx_model = decompose_quant_dequant_nodes(onnx_model)  # Decompose complex quant-dequant patterns into simpler nodes
-
-    # onnx_model = rename_parameter_initializers(onnx_model)  # Ensure all initializers have unique names
+    # onnx_model = fix_squeeze_axes_inputs(onnx_model)  # Ensure Squeeze nodes have correct axes inputs for ONNX Runtime compatibility
+    onnx_model = rename_parameter_initializers(onnx_model)  # Ensure all initializers have unique names
 
     # onnx_model = remove_trailing_qdq(onnx_model)  # Remove unnecessary trailing QDQ nodes at the end of the graph
 

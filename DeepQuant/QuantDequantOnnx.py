@@ -114,6 +114,12 @@ def requant_shift_onnx(q_x, mul, add, div=2**15, qmin=-128, qmax=127, signed=Tru
 
     return out.astype(q_x.dtype)
 
+# @onnx_op(op_type="Gelu", domain="com.microsoft", inputs=[PyOp.dt_float],
+#                             outputs=[PyOp.dt_float])
+# def gelu_onnx(x):
+#     """GELU activation function for ONNX export.
+#     """
+#     return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * np.power(x, 3))))
 
 class RequantShift(Function):
     @staticmethod
@@ -176,3 +182,5 @@ class Quant(Function):
     def symbolic(g, x, scale, zero_point=0.0, signed=True, n_levels=256):
         # ONNX export representation
         return g.op("ai.onnx.contrib", x, scale, zero_point, signed=signed, n_levels=n_levels)
+    
+    
