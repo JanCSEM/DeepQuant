@@ -406,7 +406,6 @@ def move_special_nodes_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelPro
                 quant_node = next_node.outputs[0].outputs[0] if next_node.outputs and len(next_node.outputs[0].outputs) == 1 else None
                 if not quant_node or quant_node.op != "Quant":
                     continue
-                
                 # Pattern matched: Dequant -> (Reshape|Transpose)* -> Quant
                 # Move special nodes after Quant
 
@@ -424,9 +423,8 @@ def move_special_nodes_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelPro
                     for consumer in quant_node.outputs[0].outputs:
                         for k, inp in enumerate(consumer.inputs):
                             if inp == quant_node.outputs[0]:
-                                consumer.inputs[k] = special_nodes[-1].outputs[0]
+                                consumer.inputs[k] = special_nodes[0].outputs[0]
 
-                # check new chain:
                 print(F"new chain: {effective_linear_op.name} -> {dequant_node.name} -> {quant_node.name} -> {[n.name for n in special_nodes]} -> consumers: {[c.name for c in quant_node.outputs[0].outputs]}")
                 fusion_occured = True
                 break
@@ -438,78 +436,163 @@ def move_special_nodes_after_quant(onnx_model: onnx.ModelProto) -> onnx.ModelPro
     return gs.export_onnx(graph)
 
 
+def _find_downstream_linear_dequant(quant_node: gs.Node, graph: gs.Graph):
+    """
+    Traverse from quant_node's output through quant-agnostic ops to find the
+    first Dequant node that immediately follows a linear op (Conv/Gemm/MatMul).
+
+    Used to propagate a scale correction when the upstream activation Quant node
+    has its scale replaced (e.g., by remove_intermediate_qdq_and_preserve_relu),
+    so that the downstream Dequant reflects the corrected integer scale.
+    """
+    consumers: dict = {}
+    for n in graph.nodes:
+        for inp in n.inputs:
+            if isinstance(inp, gs.Variable):
+                consumers.setdefault(inp.name, []).append(n)
+
+    queue = [v for v in quant_node.outputs if isinstance(v, gs.Variable)]
+    visited: set = set()
+    while queue:
+        var = queue.pop(0)
+        if var.name in visited:
+            continue
+        visited.add(var.name)
+        for consumer in consumers.get(var.name, []):
+            if consumer.op in _QUANT_AGNOSTIC_OPS:
+                queue.extend(v for v in consumer.outputs if isinstance(v, gs.Variable))
+            elif consumer.op in _LINEAR_OPS:
+                for out in consumer.outputs:
+                    if isinstance(out, gs.Variable):
+                        for downstream in consumers.get(out.name, []):
+                            if downstream.op == "Dequant" and downstream.domain == "ai.onnx.contrib":
+                                return downstream
+    return None
+
+
 def replace_mul_with_dequant_and_quant_pattern(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
     """
-    Replace (mul) with custom Dequant, and (div+round+clip) with custom Quant nodes.
+    Replace (sub->mul) with custom Dequant, and (div->(add)->round->clip) with custom Quant nodes.
     The new Quant nodes will have 'n_levels' and 'signed' attributes inferred from
     the Clip node's parameters.
+
+    Also handles plain Mul (no preceding Sub, i.e. zero_point=0) as Dequant when the Mul
+    feeds directly into a Div->Round->Clip quantization pattern.
     """
     graph = gs.import_onnx(onnx_model)
+    # Fold constants so that reshaped scale tensors appear as gs.Constant,
+    # allowing _is_mul_dequant to identify them correctly.
+    graph.fold_constants()
+    producers, _ = _build_maps(graph)
     nodes_to_add = []
     nodes_to_remove = []
+    # Track Mul nodes already scheduled for removal to avoid double-processing.
+    removed_mul_ids: set = set()
 
-    for node in graph.nodes:
-        # --- Detect Dequant pattern: mul(input, scale) ---
-        if node.op == "Mul" and _is_const(node.inputs[1]):
-            # Create a new Dequant node
-            dequant_node = gs.Node(
-                op="Dequant",
-                name=node.name + "_dequant" if node.name else "_dequant",
-                inputs=[node.inputs[0], node.inputs[1]],
-                outputs=node.outputs,
-                domain="ai.onnx.contrib"
-            )
-            nodes_to_add.append(dequant_node)
-            nodes_to_remove.append(node)
+    # --- Detect Dequant pattern: sub(input, zp) -> mul(?, scale) ---
+    for node in list(graph.nodes):
+        if node.op == "Mul":
+            mul_in = node.inputs[0]
+            mul_scale = node.inputs[1]
+            if isinstance(mul_in, gs.Variable):
+                sub_node = producers.get(mul_in.name)
+                if sub_node and sub_node.op == "Sub":
+                    sub_in = sub_node.inputs[0]
+                    zp = sub_node.inputs[1]
+                    # Replace Sub -> Mul with Dequant
+                    dequant_node = gs.Node(
+                        op="Dequant",
+                        name=node.name + "_dequant" if node.name else "_dequant",
+                        inputs=[sub_in, mul_scale, zp],
+                        outputs=node.outputs,
+                        domain="ai.onnx.contrib"
+                    )
+                    nodes_to_add.append(dequant_node)
+                    nodes_to_remove.extend([sub_node, node])
+                    removed_mul_ids.add(id(node))
 
-        # --- Detect Quant pattern: div -> round -> clip ---
-        if node.op == "Div" and _is_const(node.inputs[1]):
-            # Check if the output of Div is used ONLY by a Round node
-            if not node.outputs or len(node.outputs[0].outputs) != 1 or node.outputs[0].outputs[0].op != "Round":
-                continue
-            round_node = node.outputs[0].outputs[0]
+    # --- Detect Quant pattern: div -> (optional add) -> round -> clip ---
+    for node in list(graph.nodes):
+        if node.op == "Clip":
+            match = _match_quant_from_var(node.outputs[0], producers)
+            if match:
+                div, add, rnd, clip, src = match
+                scale = div.inputs[1]
+                # Use a unique name per Clip to avoid duplicate initializer warnings.
+                zp = add.inputs[1] if add else gs.Constant(
+                    f"{clip.name}_zero_point", np.array(0, dtype=np.float32)
+                )
+                # Infer n_levels and signed from clip
+                clip_min_val = clip.inputs[1].values.item()
+                clip_max_val = clip.inputs[2].values.item()
+                signed = bool(clip_min_val < 0)
+                n_levels = int(clip_max_val - clip_min_val + 1)
+                bitwidth = int(np.log2(n_levels)) if n_levels > 0 else 0
+                quant_node = gs.Node(
+                    op="Quant",
+                    name=clip.name + "_quant" if clip.name else "_quant",
+                    inputs=[src, scale, zp],
+                    outputs=clip.outputs,
+                    attrs={"bit_width": bitwidth, "signed": int(signed), "n_levels": n_levels},
+                    domain="ai.onnx.contrib"
+                )
+                nodes_to_add.append(quant_node)
+                # Remove all pattern nodes
+                nodes_to_remove.extend([div, rnd, clip])
+                if add:
+                    nodes_to_remove.append(add)
 
-            # Check if the output of Round is used ONLY by a Clip node
-            if not round_node.outputs or len(round_node.outputs[0].outputs) != 1 or round_node.outputs[0].outputs[0].op != "Clip":
-                continue
-            clip_node = round_node.outputs[0].outputs[0]
+                # If the Quant's data input (src) comes from a plain Mul that acts as
+                # a dequantization (no preceding Sub), replace it with a Dequant node.
+                # Also handle the case where an agnostic op (e.g. MaxPool) sits between
+                # the Mul and this Quant: Mul -> AgnosticOp -> Quant.
+                src_producer = producers.get(src.name)
+                # Look through agnostic ops to find an upstream Mul
+                mul_candidate = None
+                if src_producer is not None and src_producer.op == "Mul":
+                    mul_candidate = src_producer
+                elif (
+                    src_producer is not None
+                    and src_producer.op in _QUANT_AGNOSTIC_OPS
+                    and src_producer.inputs
+                ):
+                    agnostic_input = src_producer.inputs[0]
+                    if isinstance(agnostic_input, gs.Variable):
+                        upstream = producers.get(agnostic_input.name)
+                        if upstream is not None and upstream.op == "Mul":
+                            mul_candidate = upstream
 
-            # --- Infer Attributes from Clip node ---
-            # The Clip node must have constant min and max values
-            if len(clip_node.inputs) < 3 or not _is_const(clip_node.inputs[1]) or not _is_const(clip_node.inputs[2]):
-                continue
-
-            clip_min_val = clip_node.inputs[1].values.item()
-            clip_max_val = clip_node.inputs[2].values.item()
-
-            # Determine signedness and number of levels
-            signed = bool(clip_min_val < 0)
-            n_levels = int(clip_max_val - clip_min_val + 1)
-            bitwidth = int(math.log2(n_levels)) if n_levels > 0 else 0
-            # Create a new Quant node with the inferred attributes
-            quant_node = gs.Node(
-                op="Quant",
-                name=clip_node.name + "_quant" if clip_node.name else "_quant",
-                # Inputs from Div, outputs from Clip
-                inputs=[node.inputs[0],
-                        node.inputs[1], # scale
-                        gs.Constant(f"{clip_node.name}_n_levels", np.array(n_levels, dtype=np.int64)),
-                        gs.Constant(f"{clip_node.name}_signed", np.array(int(signed), dtype=np.int64))                ],
-                outputs=clip_node.outputs,
-                attrs={"bit_width": bitwidth, "signed": int(signed)},
-                domain="ai.onnx.contrib"
-            )
-            nodes_to_add.append(quant_node)
-            # Mark the entire pattern for removal
-            nodes_to_remove.extend([node, round_node, clip_node])
+                if (
+                    mul_candidate is not None
+                    and id(mul_candidate) not in removed_mul_ids
+                    and _is_mul_dequant(mul_candidate)
+                ):
+                    mul_data = _non_const_input(mul_candidate)
+                    mul_scale_dq = _const_input(mul_candidate)
+                    if mul_data is not None and mul_scale_dq is not None:
+                        sub_node = producers.get(mul_data.name)
+                        if not (sub_node and sub_node.op == "Sub"):
+                            # Plain Mul (zero_point = 0): convert to Dequant
+                            dzp = gs.Constant(
+                                f"{mul_candidate.name}_zero_point",
+                                np.array(0, dtype=np.float32)
+                            )
+                            dequant_node = gs.Node(
+                                op="Dequant",
+                                name=mul_candidate.name + "_dequant" if mul_candidate.name else "_dequant",
+                                inputs=[mul_data, mul_scale_dq, dzp],
+                                outputs=mul_candidate.outputs,
+                                domain="ai.onnx.contrib"
+                            )
+                            nodes_to_add.append(dequant_node)
+                            nodes_to_remove.append(mul_candidate)
+                            removed_mul_ids.add(id(mul_candidate))
 
     # Add new nodes and remove old ones
     graph.nodes.extend(nodes_to_add)
     for n in nodes_to_remove:
-        # Disconnect the node from the graph completely before removal
         n.outputs.clear()
     graph.cleanup().toposort()
-
     return gs.export_onnx(graph)
 
 def remove_intermediate_qdq_and_preserve_relu(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
@@ -554,23 +637,27 @@ def remove_intermediate_qdq_and_preserve_relu(onnx_model: onnx.ModelProto) -> on
 
             # --- Pattern Matched: DQ1 -> Q2 -> DQ2 -> Q3 ---
 
-            # Check if Quant2 is unsigned (acting as a ReLU)
-            # We assume the 'signed' parameter is the 4th input (index 3)
-            is_quant2_unsigned = False
-            if len(quant2_node.inputs) > 3 and isinstance(quant2_node.inputs[3], gs.Constant):
-                if int(quant2_node.inputs[3].values) == 0:
-                    is_quant2_unsigned = True
+            # Check if Quant2 is unsigned (acting as a ReLU) via its 'signed' attribute
+            is_quant2_unsigned = (int(quant2_node.attrs.get("signed", 1)) == 0)
 
             # Reroute the graph by connecting Dequant1's output to Quant3's input
             quant3_node.inputs[0] = dequant1_node.outputs[0]
 
             if is_quant2_unsigned:
-                # --- Modify Quant3 to perform the ReLU clip ---
-                # By changing n_levels to 128 on a signed quantizer, we force the range to [0, 127]
-                # We assume n_levels is the 3rd input (index 2)
-                if len(quant3_node.inputs) > 2 and isinstance(quant3_node.inputs[2], gs.Constant):
-                    n_levels_const = quant3_node.inputs[2]
-                    quant3_node.inputs[2] = gs.Constant(n_levels_const.name, np.array(128, dtype=np.int64))
+                # Quant2 acts as ReLU (unsigned). After bypassing Quant2→Dequant2, we
+                # preserve the clipping-to-zero by making Quant3 clip to [0, 127] while
+                # keeping its original scale unchanged. Changing the scale here would
+                # shift the quantisation grid (relu_scale → act_scale) and introduce
+                # per-activation rounding differences that accumulate through downstream
+                # linear layers.
+                #
+                # We use signed=0, bit_width=7, n_levels=128 ("7-bit unsigned") so that
+                # the [0, 127] clip range is consistent across exec_quant (uses bit_width),
+                # decompose_quant_dequant_nodes (uses n_levels), and
+                # fuse_requant_shift_pattern (uses bit_width for RequantShift n_levels).
+                quant3_node.attrs["signed"] = 0
+                quant3_node.attrs["n_levels"] = 128
+                quant3_node.attrs["bit_width"] = 7
 
 
             # Mark the intermediate nodes for removal.
@@ -586,80 +673,6 @@ def remove_intermediate_qdq_and_preserve_relu(onnx_model: onnx.ModelProto) -> on
     graph.cleanup().toposort()
     return gs.export_onnx(graph)
 
-def _find_producer_quant_node_recursively(var: gs.Variable, producers: dict) -> gs.Node | None:
-    """
-    Recursively searches backwards from a variable to find the producing Quant node,
-    skipping over quantization-agnostic operations.
-    """
-    if not isinstance(var, gs.Variable) or var.name not in producers:
-        return None
-
-    producer_node = producers[var.name]
-
-    if producer_node.op == "Quant":
-        return producer_node
-
-    else:
-        return _find_producer_quant_node_recursively(producer_node.inputs[0], producers)
-
-
-def simplify_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
-    """
-    Simplifies custom Quant and Dequant nodes by moving quantization parameters
-    from inputs to node attributes. It also converts the 'n_levels' parameter
-    to 'bitwidth'.
-    """
-    graph = gs.import_onnx(onnx_model)
-    producers, _ = _build_maps(graph)
-
-    for node in list(graph.nodes):
-        if node.domain != "ai.onnx.contrib":
-            continue
-
-        # --- Simplify Dequant node ---
-        if node.op == "Dequant":
-            # Dequant(data, scale) -> Dequant(data) with scale and zero_point attributes
-            if len(node.inputs) > 1 and isinstance(node.inputs[1], gs.Constant):
-                scale_const = node.inputs[1]
-                node.attrs["scale"] = scale_const
-                node.attrs["zero_point"] = 0  # Add zero_point attribute
-
-                # Recursively find the preceding Quant node to get n_levels and signed status
-                producer_quant_node = _find_producer_quant_node_recursively(node.inputs[0], producers)
-
-                if producer_quant_node:
-                    bitwidth = producer_quant_node.attrs["bit_width"] if "bit_width" in producer_quant_node.attrs else None
-                    signed = producer_quant_node.attrs["signed"] if "signed" in producer_quant_node.attrs else None
-
-                    node.attrs["bit_width"] =  bitwidth
-                    node.attrs["signed"] = signed
-
-                # Keep only the data input
-                node.inputs = [node.inputs[0]]
-        # --- Simplify Quant node ---
-        elif node.op == "Quant":
-            # Quant(data, scale, n_levels, signed) -> Quant(data) with attributes
-            if len(node.inputs) > 3:
-                scale_const = node.inputs[1]
-                n_levels_const = node.inputs[2]
-                signed_const = node.inputs[3]
-
-                if all(isinstance(c, gs.Constant) for c in [scale_const, n_levels_const, signed_const]):
-                    # Move scale and signed to attributes
-                    node.attrs["scale"] = scale_const
-                    node.attrs["signed"] = bool(signed_const.values.item())
-                    node.attrs["zero_point"] = 0 # Add zero_point attribute
-
-                    # Convert n_levels to bitwidth and add as attribute
-                    n_levels = int(n_levels_const.values.item())
-                    bitwidth = int(np.log2(n_levels)) if n_levels > 0 else 0
-                    node.attrs["bit_width"] = bitwidth
-
-                    # Keep only the data input
-                    node.inputs = [node.inputs[0]]
-
-    graph.cleanup().toposort()
-    return gs.export_onnx(graph)
 
 def replace_matmul_add_by_gemm(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
     """
@@ -792,10 +805,7 @@ def fuse_requant_shift_pattern(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
             quant_scale = quant_node.inputs[1].values
 
             output_zp = 0
-            if len(quant_node.inputs) > 3 and isinstance(quant_node.inputs[3], gs.Constant):
-                 is_signed = bool(quant_node.inputs[3].values.item())
-                 if not is_signed:
-                     output_zp = 0
+            is_signed = bool(quant_node.attrs.get("signed", 1))
 
             # --- Calculate RequantShift parameters ---
             # Effective scale for requantization
@@ -860,15 +870,14 @@ def fuse_requant_shift_pattern(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
                 inputs=[
                     requant_input_var,
                     gs.Constant(f"{linear_op_node.name}_mul", np.array(np.squeeze(mul), dtype=np.float32)),
-                    gs.Constant(f"{linear_op_node.name}_add", np.array(np.squeeze(add), dtype=np.float32))
+                    gs.Constant(f"{linear_op_node.name}_add", np.array(np.squeeze(add), dtype=np.float32)),
                 ],
                 outputs=[final_output_var],
                 attrs={
-                    "n_levels": gs.Constant(f"{linear_op_node.name}_n_levels", np.array([2**int(quant_node.attrs.get("bit_width", 0))], dtype=np.float32)),
-                    "signed": gs.Constant(f"{linear_op_node.name}_signed", np.array([quant_node.attrs.get("signed", 0)], dtype=np.float32)),
-                    "div": gs.Constant(f"{linear_op_node.name}_div", np.array(2**int(log2D), dtype=np.float32))
+                    "div": int(2**int(log2D)),
+                    "n_levels": int(2**int(quant_node.attrs.get("bit_width", 8))),
+                    "signed": int(quant_node.attrs.get("signed", 1)),
                 }
-               
             )
             if linear_op_node.op == "Conv":
                 if "auto_pad" in linear_op_node.attrs:
@@ -992,7 +1001,6 @@ def fuse_integer_matmul_with_requant(onnx_model: onnx.ModelProto) -> onnx.ModelP
 
     graph.cleanup().toposort()
     return gs.export_onnx(graph)
-
 def decompose_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
     """
     Decomposes custom Quant and Dequant nodes back into standard ONNX operators.
@@ -1033,15 +1041,13 @@ def decompose_quant_dequant_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProt
 
         # --- Decompose Quant node ---
         elif node.op == "Quant":
-            # Quant(data, scale, n_levels, signed) -> Div -> Round -> Clip
+            # Quant(data, scale, zp) with attrs {n_levels, signed} -> Div -> Add -> Round -> Clip
             data_input = node.inputs[0]
             scale_input = node.inputs[1]
-            n_levels_input = node.inputs[2]
-            signed_input = node.inputs[3]
 
-            # --- Calculate Clip min/max from n_levels and signed ---
-            n_levels = int(n_levels_input.values.item())
-            is_signed = bool(signed_input.values.item())
+            # --- Calculate Clip min/max from n_levels and signed attrs ---
+            n_levels = int(node.attrs.get("n_levels", 256))
+            is_signed = bool(node.attrs.get("signed", 1))
 
             if is_signed and n_levels > 128:
                 clip_min = -n_levels // 2

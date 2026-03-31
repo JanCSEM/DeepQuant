@@ -32,7 +32,8 @@ dependencies = [
     "colorama",
     "onnx",
     "onnxoptimizer",
-    "onnxruntime",
+    "onnxruntime==1.19.2",
+    "matplotlib",
 ]
 
 [tool.setuptools]

@@ -19,7 +19,6 @@ from DeepQuant.TransformQuant import fuse_integer_matmul_with_requant, fuse_requ
                                     replace_mul_with_dequant_and_quant_pattern, \
                                     decompose_quant_dequant_nodes, \
                                     rename_parameter_initializers, \
-                                    simplify_quant_dequant_nodes, \
                                     move_special_nodes_after_quant, \
                                     merge_consecutive_divs, \
                                     restore_gelu_nodes, \
@@ -60,6 +59,7 @@ from DeepQuant.Utils.GraphPrinter import (
 from DeepQuant.Utils.FxInterpreter import NodeTracer
 import DeepQuant.QuantDequantOnnx # path to custom ONNX operators for quantization/dequantization patterns
 from DeepQuant.QuantDequantOnnx import Quant, Dequant, RequantShift
+from DeepQuant.onnx_node_implementations import run_onnx_graph
 # ANSI color codes for improved debug output readability
 BLUE = "\033[94m"
 RED = "\033[31m"
@@ -174,9 +174,9 @@ def exportBrevitas(
     )  # Get scale, zero_point, bit_width for each quant node
 
     # if debug:
-    print_quant_params(
-        proxyParams
-    )  # Display extracted parameters in a readable format
+    # print_quant_params(
+    #     proxyParams
+    # )  # Display extracted parameters in a readable format
 
     # Split quantization nodes into separate Quant and Dequant nodes
     splitFxModel = split_quant_nodes(
@@ -251,61 +251,62 @@ def exportBrevitas(
         # )
 
 
-    # Step 2: Load the model and run shape inference
-    # (All tensors in ONNX graph should have explicit shape information)
+    # Step 2: Apply ONNX graph transformation passes with per-pass numerical checks.
+    # Each check runs the graph with a pure-Python executor (no ORT dependency)
+    # and compares against the original Brevitas reference output.
+    ref_output = outputModel.detach().cpu().numpy()
+    ort_input = {"input": exampleInput.cpu().numpy()}
+    atol = 1.0  # 1 LSB tolerance for quantised integer arithmetic
+
+    def _check(model: onnx.ModelProto, step_name: str) -> None:
+        try:
+            onnx_out = run_onnx_graph(model, ort_input)
+            max_diff = float(np.max(np.abs(onnx_out - ref_output)))
+            if np.allclose(onnx_out, ref_output, atol=atol):
+                print(f"{BLUE} ✓ {step_name}: output consistent (max_diff={max_diff:.6f}){ENDC}")
+            else:
+                print(
+                    f"{RED} ✗ {step_name}: output differs "
+                    f"(max_diff={max_diff:.6f}, atol={atol}){ENDC}"
+                )
+                print(f"    ref : {ref_output.flatten()[:10]}")
+                print(f"    onnx: {onnx_out.flatten()[:10]}")
+        except Exception as e:
+            print(f"{RED} ✗ {step_name}: executor failed — {e}{ENDC}")
+
     onnx_model = onnx.load_model_from_string(f.getvalue())
+
+    onnx_model = rename_parameter_initializers(onnx_model)
+    _check(onnx_model, "rename_parameter_initializers")
+
     onnx_model = restore_gelu_nodes(onnx_model)
+    _check(onnx_model, "restore_gelu_nodes")
+
     onnx_model = merge_consecutive_divs(onnx_model)
-    onnx_model = replace_mul_with_dequant_and_quant_pattern(onnx_model)  # Replace QDQ nodes with separate Quant and Dequant nodes
+    _check(onnx_model, "merge_consecutive_divs")
+
+    onnx_model = replace_mul_with_dequant_and_quant_pattern(onnx_model)
+    _check(onnx_model, "replace_mul_with_dequant_and_quant_pattern")
+
     onnx_model = move_agnostic_ops_after_quant(onnx_model)
-    onnx_model = remove_intermediate_qdq_and_preserve_relu(onnx_model)  # Fuse consecutive Rescale-QDQ patterns into single nodes
-    onnx_model = move_special_nodes_after_quant(onnx_model)  # Move special nodes (e.g., ReLU) after quantization nodes where possible for better optimization
-    onnx_model = fuse_requant_shift_pattern(onnx_model) # Fuse RequantShift patterns into single nodes for better optimization
-    onnx_model = fuse_integer_matmul_with_requant(onnx_model)  # Fuse integer MatMul with Requantize patterns
-    onnx_model = decompose_quant_dequant_nodes(onnx_model)  # Decompose complex quant-dequant patterns into simpler nodes
-    # onnx_model = fix_squeeze_axes_inputs(onnx_model)  # Ensure Squeeze nodes have correct axes inputs for ONNX Runtime compatibility
-    onnx_model = rename_parameter_initializers(onnx_model)  # Ensure all initializers have unique names
+    _check(onnx_model, "move_agnostic_ops_after_quant")
 
-    # onnx_model = remove_trailing_qdq(onnx_model)  # Remove unnecessary trailing QDQ nodes at the end of the graph
+    onnx_model = remove_intermediate_qdq_and_preserve_relu(onnx_model)
+    _check(onnx_model, "remove_intermediate_qdq_and_preserve_relu")
 
-    # # Test numerical consistency after ONNX transformations
-    # input_scale = proxyParams['input']['scale'] if 'input' in proxyParams else 1.0
-    # input_zero_point = proxyParams['input']['zero_point'] if 'input' in proxyParams else 0
-    # input_bit_width = proxyParams['input']['bit_width'] if 'input' in proxyParams else 8
+    onnx_model = move_special_nodes_after_quant(onnx_model)
+    _check(onnx_model, "move_special_nodes_after_quant")
 
-    # # Quantize input (simulate int8 quantization)
-    # qmin = 2 ** (input_bit_width - 1) * -1
-    # qmax = 2 ** input_bit_width - 1
-    # input_fp = exampleInput.cpu().numpy()
-    # input_q = np.clip(np.round(input_fp / input_scale + input_zero_point), qmin, qmax).astype(np.int8)
+    onnx_model = fuse_requant_shift_pattern(onnx_model)
+    _check(onnx_model, "fuse_requant_shift_pattern")
 
-    # --- Run inference with ONNX Runtime ---
-    # so = ort.SessionOptions()
-    # so.register_custom_ops_library(get_library_path())  # Register custom ops from DeepQuant
-    # ort_session = ort.InferenceSession(onnx_model.SerializeToString(), so, providers=["CPUExecutionProvider"])
-    # ort_inputs = {"input": exampleInput.cpu().numpy()}
-    # ort_output = ort_session.run(None, ort_inputs)[0]
+    onnx_model = fuse_integer_matmul_with_requant(onnx_model)
+    _check(onnx_model, "fuse_integer_matmul_with_requant")
 
-    # checked_output = np.allclose(ort_output, outputModel.cpu().numpy(), atol=1e-5)
-    # if checked_output:
-    #     print(f"{BLUE} ✓ ONNX Runtime inference output is consistent with original model{ENDC}")
-    # else:
-    #     print(f"{RED} ✗ ONNX Runtime inference output differs from original model{ENDC}")
-    #     ref_output = outputModel.cpu().numpy()
-    #     test_output = ort_output
+    onnx_model = decompose_quant_dequant_nodes(onnx_model)
+    _check(onnx_model, "decompose_quant_dequant_nodes")
 
-    #     # Save reference (PyTorch) output
-    #     with open("ref.txt", "w") as f:
-    #         np.savetxt("ref.txt", ref_output.flatten(), fmt="%.8f")
-
-    #     # Save test (ONNX Runtime) output
-    #     with open("test.txt", "w") as f:
-    #         np.savetxt("test.txt", test_output.flatten(), fmt="%.8f")
-    #     print(F"max diff: {np.max(np.abs(ort_output - outputModel.cpu().numpy()))}")
-        # raise RuntimeError("ONNX Runtime inference output differs from original model")  # Raise error if inconsistent
-
-    # This pass does not make numerical changes, but can't be run with onnx runtime.
-    
-    # onnx_model = simplify_quant_dequant_nodes(onnx_model)  # Decompose complex quant-dequant patterns into simpler nodes
+    onnx_model = fix_squeeze_axes_inputs(onnx_model)
+    _check(onnx_model, "fix_squeeze_axes_inputs")
 
     return onnx_model  # Return the final optimized FX GraphModule
