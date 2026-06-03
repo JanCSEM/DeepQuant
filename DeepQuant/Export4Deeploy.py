@@ -11,7 +11,10 @@ from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 import onnx
-from onnxruntime_extensions import get_library_path
+try:
+    from onnxruntime_extensions import get_library_path
+except ImportError:
+    get_library_path = None
 
 from DeepQuant.TransformQuant import fuse_integer_matmul_with_requant, fuse_requant_shift_pattern, move_agnostic_ops_after_quant, \
                                     remove_intermediate_qdq_and_preserve_relu,\
